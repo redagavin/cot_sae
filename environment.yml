@@ -1,0 +1,21 @@
+# ABOUTME: Conda environment definition for the CoT-SAE research project.
+# ABOUTME: Specifies Python version and core dependencies for SAE-based faithfulness analysis.
+
+name: cot_sae
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch
+    - transformers
+    - sae-lens
+    - transformer-lens
+    - datasets
+    - numpy
+    - pandas
+    - matplotlib
+    - tqdm
+    - jupyter
