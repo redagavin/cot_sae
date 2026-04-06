@@ -77,9 +77,26 @@ def analyze_layer_width(
             "available": False,
         }
 
+    # Filter out zero-length activations before encoding
+    valid_pairs = [
+        (nh, cond) for nh, cond in zip(no_hint_activations, condition_activations)
+        if nh.shape[0] > 0 and cond.shape[0] > 0
+    ]
+    if not valid_pairs:
+        del sae
+        return {
+            "layer": layer,
+            "width_k": width_k,
+            "mean_pool": {"n_differential": 0, "feature_indices": [], "effect_sizes": []},
+            "max_pool": {"n_differential": 0, "feature_indices": [], "effect_sizes": []},
+            "available": True,
+        }
+
+    valid_nh, valid_cond = zip(*valid_pairs)
+
     # Encode once, pool twice
-    nh_features_list = [extract_sae_features(sae, act) for act in no_hint_activations]
-    cond_features_list = [extract_sae_features(sae, act) for act in condition_activations]
+    nh_features_list = [extract_sae_features(sae, act) for act in valid_nh]
+    cond_features_list = [extract_sae_features(sae, act) for act in valid_cond]
 
     results_by_pool = {}
     for method in ["mean", "max"]:

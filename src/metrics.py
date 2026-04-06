@@ -79,13 +79,10 @@ def find_differential_features(
     """
     baseline_np = baseline.detach().cpu().numpy()
     condition_np = condition.detach().cpu().numpy()
-    n_features = baseline_np.shape[1]
 
-    # Paired t-tests
-    p_values = np.full(n_features, np.nan)
-    for i in range(n_features):
-        _, p_val = stats.ttest_rel(baseline_np[:, i], condition_np[:, i])
-        p_values[i] = p_val
+    # Vectorized paired t-test across all features at once
+    with np.errstate(divide="ignore", invalid="ignore"):
+        _, p_values = stats.ttest_rel(baseline_np, condition_np, axis=0)
 
     # FDR correction
     rejected = benjamini_hochberg(p_values, q_threshold)

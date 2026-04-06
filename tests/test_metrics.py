@@ -92,6 +92,7 @@ class TestBenjaminiHochberg:
         assert not rejected[1]
 
 
+@pytest.mark.filterwarnings("ignore:Precision loss occurred:RuntimeWarning")
 class TestFindDifferentialFeatures:
     def test_detects_shifted_features_paired(self):
         torch.manual_seed(42)

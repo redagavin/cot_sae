@@ -30,6 +30,7 @@ class TestPoolFeatures:
         assert result[0].item() == pytest.approx(2.0)
 
 
+@pytest.mark.filterwarnings("ignore:Precision loss occurred:RuntimeWarning")
 class TestAnalyzeFeatures:
     def test_returns_expected_keys(self):
         baseline = torch.randn(50, 100)

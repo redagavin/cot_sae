@@ -11,7 +11,7 @@ dependencies:
   - pip:
     - torch
     - transformers
-    - sae-lens
+    - sae-lens>=4.0
     - transformer-lens
     - datasets
     - numpy
