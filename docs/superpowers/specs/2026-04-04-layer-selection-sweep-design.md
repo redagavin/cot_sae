@@ -62,7 +62,7 @@ These measure different things and can disagree. Comparing them gives a more com
 
 ## Output
 
-A recommendation of which 2-3 layers and which SAE width to use for the full divergence localization experiment in the next development cycle. Uses rank-aggregation across cosine distance, JSD, and SAE feature counts.
+A recommendation of which 3 layers and which SAE width to use for the full divergence localization experiment in the next development cycle. Uses rank-aggregation across cosine distance, JSD, and SAE feature counts.
 
 ## Metrics
 
