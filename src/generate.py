@@ -3,12 +3,7 @@
 
 import random
 import torch
-
-try:
-    from transformer_lens import HookedTransformer
-except ImportError:
-    HookedTransformer = None
-
+from transformer_lens import HookedTransformer
 from src.config import MODEL_NAME, MAX_NEW_TOKENS, N_LAYERS
 
 
