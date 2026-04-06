@@ -56,7 +56,59 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 ```
 
-- [ ] **Step 4: Write config.py**
+- [ ] **Step 4: Write failing tests for config invariants**
+
+Create `tests/test_config.py`:
+```python
+# ABOUTME: Tests for configuration consistency and invariants.
+# ABOUTME: Validates that hint formats, keywords, conditions, and paths are well-formed.
+
+from pathlib import Path
+from src.config import (
+    HINT_FORMATS,
+    HINT_KEYWORDS,
+    CONDITIONS,
+    ANSWER_LETTERS,
+    SAE_WIDTHS,
+    N_LAYERS,
+    DATA_DIR,
+    OUTPUTS_DIR,
+)
+
+
+class TestConfigConsistency:
+    def test_hint_format_keys_match_keyword_keys(self):
+        assert set(HINT_FORMATS.keys()) == set(HINT_KEYWORDS.keys())
+
+    def test_all_hint_keywords_are_nonempty(self):
+        for fmt, keywords in HINT_KEYWORDS.items():
+            assert len(keywords) > 0, f"No keywords for format {fmt}"
+
+    def test_conditions_contains_expected(self):
+        assert "no_hint" in CONDITIONS
+        assert "true_hint" in CONDITIONS
+        assert "false_hint" in CONDITIONS
+
+    def test_answer_letters_are_four(self):
+        assert ANSWER_LETTERS == ["A", "B", "C", "D"]
+
+    def test_sae_widths_are_positive(self):
+        assert all(w > 0 for w in SAE_WIDTHS)
+
+    def test_n_layers_positive(self):
+        assert N_LAYERS > 0
+
+    def test_paths_are_path_objects(self):
+        assert isinstance(DATA_DIR, Path)
+        assert isinstance(OUTPUTS_DIR, Path)
+```
+
+- [ ] **Step 5: Run tests to verify they fail**
+
+Run: `conda run -n cot_sae pytest tests/test_config.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'src.config'`
+
+- [ ] **Step 6: Write config.py**
 
 ```python
 # ABOUTME: Central configuration for the layer selection sweep experiment.
@@ -109,59 +161,12 @@ ANSWER_LETTERS = ["A", "B", "C", "D"]
 # Chat template is handled by tokenizer.apply_chat_template()
 ```
 
-- [ ] **Step 5: Write tests for config invariants**
-
-Create `tests/test_config.py`:
-```python
-# ABOUTME: Tests for configuration consistency and invariants.
-# ABOUTME: Validates that hint formats, keywords, conditions, and paths are well-formed.
-
-from pathlib import Path
-from src.config import (
-    HINT_FORMATS,
-    HINT_KEYWORDS,
-    CONDITIONS,
-    ANSWER_LETTERS,
-    SAE_WIDTHS,
-    N_LAYERS,
-    DATA_DIR,
-    OUTPUTS_DIR,
-)
-
-
-class TestConfigConsistency:
-    def test_hint_format_keys_match_keyword_keys(self):
-        assert set(HINT_FORMATS.keys()) == set(HINT_KEYWORDS.keys())
-
-    def test_all_hint_keywords_are_nonempty(self):
-        for fmt, keywords in HINT_KEYWORDS.items():
-            assert len(keywords) > 0, f"No keywords for format {fmt}"
-
-    def test_conditions_contains_expected(self):
-        assert "no_hint" in CONDITIONS
-        assert "true_hint" in CONDITIONS
-        assert "false_hint" in CONDITIONS
-
-    def test_answer_letters_are_four(self):
-        assert ANSWER_LETTERS == ["A", "B", "C", "D"]
-
-    def test_sae_widths_are_positive(self):
-        assert all(w > 0 for w in SAE_WIDTHS)
-
-    def test_n_layers_positive(self):
-        assert N_LAYERS > 0
-
-    def test_paths_are_path_objects(self):
-        assert isinstance(DATA_DIR, Path)
-        assert isinstance(OUTPUTS_DIR, Path)
-```
-
-- [ ] **Step 6: Run tests to verify they pass**
+- [ ] **Step 7: Run tests to verify they pass**
 
 Run: `conda run -n cot_sae pytest tests/test_config.py -v`
 Expected: All tests PASS
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/__init__.py src/config.py tests/__init__.py tests/conftest.py tests/test_config.py
@@ -1071,6 +1076,9 @@ def main():
         json.dump(selected, f, indent=2)
 
     print(f"Baseline complete: {len(correct)}/{len(results)} correct.")
+    if len(selected) < TARGET_CORRECT:
+        print(f"WARNING: Only found {len(selected)}/{TARGET_CORRECT} correct answers. "
+              f"Consider increasing BASELINE_POOL_SIZE or checking prompt formatting.")
     print(f"Selected {len(selected)} questions saved to {DATA_DIR / 'selected_questions.json'}")
 
 
@@ -1498,7 +1506,6 @@ def main():
     torch.save(true_heatmaps, results_dir / "heatmaps_true_hint.pt")
 
     # Save count-weighted means for use by run_comparison.py
-    import json
     with open(results_dir / "weighted_means.json", "w") as f:
         json.dump({"false_hint": false_weighted, "true_hint": true_weighted}, f, indent=2)
 
@@ -1673,14 +1680,14 @@ def analyze_layer_width(
     layer: int,
     width_k: int,
     no_hint_activations: list[torch.Tensor],
-    false_hint_activations: list[torch.Tensor],
+    condition_activations: list[torch.Tensor],
     q_threshold: float = 0.05,
 ) -> dict:
     """Analyze differential SAE features for one layer/width using both pooling methods.
 
     Args:
         no_hint_activations: list of tensors, each [seq_len, hidden_dim]
-        false_hint_activations: list of tensors, each [seq_len, hidden_dim]
+        condition_activations: list of tensors, each [seq_len, hidden_dim] (any hint condition)
     """
     try:
         sae = load_sae(layer, width_k)
@@ -1696,15 +1703,15 @@ def analyze_layer_width(
 
     # Encode once, pool twice
     nh_features_list = [extract_sae_features(sae, act) for act in no_hint_activations]
-    fh_features_list = [extract_sae_features(sae, act) for act in false_hint_activations]
+    cond_features_list = [extract_sae_features(sae, act) for act in condition_activations]
 
     results_by_pool = {}
     for method in ["mean", "max"]:
         nh_pooled = [pool_features(f, method) for f in nh_features_list]
-        fh_pooled = [pool_features(f, method) for f in fh_features_list]
+        cond_pooled = [pool_features(f, method) for f in cond_features_list]
 
         baseline = torch.stack(nh_pooled)
-        condition = torch.stack(fh_pooled)
+        condition = torch.stack(cond_pooled)
         results_by_pool[f"{method}_pool"] = analyze_features(baseline, condition, q_threshold)
 
     del sae
@@ -1759,10 +1766,17 @@ def load_layer_activations_by_format(
         nh_full = torch.load(activations_dir / f"{nh_entry['run_id']}.pt", weights_only=True)
         cond_full = torch.load(activations_dir / f"{cond_entry['run_id']}.pt", weights_only=True)
 
-        nh_acts.append(nh_full[layer][nh_entry["prompt_length"]:].float())
-        cond_acts.append(cond_full[layer][cond_entry["prompt_length"]:].float())
+        nh_slice = nh_full[layer][nh_entry["prompt_length"]:].float()
+        cond_slice = cond_full[layer][cond_entry["prompt_length"]:].float()
 
         del nh_full, cond_full
+
+        # Skip zero-length slices (no generated tokens)
+        if len(nh_slice) == 0 or len(cond_slice) == 0:
+            continue
+
+        nh_acts.append(nh_slice)
+        cond_acts.append(cond_slice)
 
     return nh_acts, cond_acts
 
@@ -1953,7 +1967,7 @@ def plot_divergence_heatmap(
 def plot_layer_comparison(
     logit_cosine: list[float],
     logit_jsd: list[float],
-    sae_counts: dict[int, list[int]],
+    sae_counts: dict[int, list[float]],
     save_path: Path,
 ):
     """Plot logit lens divergence and SAE differential counts side by side."""
