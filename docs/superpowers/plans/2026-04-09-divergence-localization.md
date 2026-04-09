@@ -4,9 +4,9 @@
 
 **Goal:** Build a pipeline that trains linear classifiers on SAE features at fractional positions to produce AUC(fraction) curves showing when hint-related divergence becomes detectable in the model's internals.
 
-**Architecture:** Two-phase pipeline. Phase 1 (GPU): batched generation over full MMLU, SAE encoding at fractional positions, sparse feature storage. Phase 2 (CPU): logistic regression with CV, AUC curves, controls, visualization. Reuses existing `src/data.py`, `src/generate.py`, `src/sae_analysis.py` modules.
+**Architecture:** Two-phase pipeline. Phase 1 (GPU): HuggingFace batched generation with forward hooks for selective layer caching, SAE encoding at fractional positions, sparse feature storage. Phase 2 (CPU): logistic regression with GroupKFold CV, AUC curves with bootstrap CIs, controls, visualization. Reuses existing `src/data.py` for prompt construction, `src/sae_analysis.py` for SAE loading.
 
-**Tech Stack:** TransformerLens, SAELens, scikit-learn (LogisticRegression, cross_val_score, roc_auc_score), torch, scipy, matplotlib
+**Tech Stack:** HuggingFace transformers, SAELens, scikit-learn (LogisticRegression, GroupKFold, roc_auc_score), sentence-transformers, torch, numpy, matplotlib
 
 ---
 
@@ -155,7 +155,7 @@ class TestFindEosPosition:
     def test_with_prompt(self):
         tokens = torch.tensor([5, 10, 15, 1, 0])  # prompt is first 2 tokens
         pos = find_eos_position(tokens, eos_token_id=1, prompt_length=2)
-        assert pos == 3  # EOS at position 3, gen_length = 3 - 2 = 1
+        assert pos == 3  # EOS at absolute position 3
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -205,7 +205,13 @@ def from_sparse_features(sparse: dict, total_features: int) -> torch.Tensor:
     """Reconstruct a dense feature vector from sparse representation."""
     dense = torch.zeros(total_features)
     if len(sparse["indices"]) > 0:
-        dense[sparse["indices"].long()] = sparse["values"]
+        indices = sparse["indices"]
+        if not isinstance(indices, torch.Tensor):
+            indices = torch.tensor(indices)
+        values = sparse["values"]
+        if not isinstance(values, torch.Tensor):
+            values = torch.tensor(values)
+        dense[indices.long()] = values.float()
     return dense
 
 
@@ -216,7 +222,7 @@ def find_eos_position(
 ) -> int:
     """Find the position of the first EOS token after the prompt.
 
-    Returns the index of the first EOS in the generated portion,
+    Returns the absolute index of the first EOS in the generated portion,
     or the total sequence length if no EOS is found.
     """
     generated = tokens[prompt_length:]
@@ -240,153 +246,206 @@ git commit -m "feat: add fractional sampling and sparse storage utilities"
 
 ---
 
-### Task 3: Batched Generation with Selective Caching
+### Task 3: HuggingFace Model Loading and Hooked Forward Pass
 
 **Files:**
-- Create: `src/batch_generate.py`
-- Create: `tests/test_batch_generate.py`
+- Create: `src/hf_model.py`
+- Create: `tests/test_hf_model.py`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/test_batch_generate.py
-# ABOUTME: Tests for batched prompt preparation and generation result extraction.
-# ABOUTME: Uses small tensors to validate padding, masking, and EOS detection.
+# tests/test_hf_model.py
+# ABOUTME: Tests for HuggingFace model utilities — batched tokenization and hooked forward pass.
+# ABOUTME: Uses small tensors to validate padding, hook capture, and generation length detection.
 
 import pytest
 import torch
-from src.batch_generate import (
-    pad_prompts_left,
+from src.hf_model import (
+    tokenize_batch,
     extract_generation_lengths,
+    register_layer_hooks,
+    remove_hooks,
 )
 
 
-class TestPadPromptsLeft:
-    def test_pads_to_max_length(self):
-        token_lists = [
-            torch.tensor([1, 2, 3]),
-            torch.tensor([4, 5]),
-            torch.tensor([6, 7, 8, 9]),
-        ]
-        padded, mask, prompt_lengths = pad_prompts_left(token_lists, pad_token_id=0)
-        assert padded.shape == (3, 4)
-        assert mask.shape == (3, 4)
-        assert prompt_lengths == [3, 2, 4]
-
-    def test_left_padding(self):
-        token_lists = [
-            torch.tensor([1, 2, 3]),
-            torch.tensor([4, 5]),
-        ]
-        padded, mask, prompt_lengths = pad_prompts_left(token_lists, pad_token_id=0)
-        # Shorter sequence should be left-padded
-        assert padded[1, 0].item() == 0  # pad
-        assert padded[1, 1].item() == 4
-        assert padded[1, 2].item() == 5
-
-    def test_attention_mask(self):
-        token_lists = [
-            torch.tensor([1, 2, 3]),
-            torch.tensor([4, 5]),
-        ]
-        padded, mask, prompt_lengths = pad_prompts_left(token_lists, pad_token_id=0)
-        assert mask[0].tolist() == [1, 1, 1]
-        assert mask[1].tolist() == [0, 1, 1]
+class TestTokenizeBatch:
+    def test_left_pads(self):
+        # Mock a tokenizer
+        from unittest.mock import MagicMock
+        tokenizer = MagicMock()
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token_id = 0
+        tokenizer.return_value = {
+            "input_ids": torch.tensor([[0, 1, 2, 3], [0, 0, 4, 5]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]]),
+        }
+        result = tokenize_batch(tokenizer, ["abc", "de"])
+        assert "input_ids" in result
+        assert "attention_mask" in result
 
 
 class TestExtractGenerationLengths:
     def test_finds_eos(self):
-        # batch of 2, seq_len 6, prompt_lengths [2, 3]
+        # Batch of 2, padded prompt length = 4, max_new_tokens appended
         output_tokens = torch.tensor([
-            [1, 2, 10, 11, 99, 0],  # EOS=99 at position 4
-            [0, 3, 4, 10, 99, 0],   # EOS=99 at position 4
+            [0, 1, 2, 3, 10, 11, 99, 0],  # prompt pad=4, gen=[10,11,EOS,pad]
+            [0, 0, 4, 5, 12, 99, 0, 0],   # prompt pad=4, gen=[12,EOS,pad,pad]
         ])
         gen_lengths = extract_generation_lengths(
-            output_tokens, prompt_lengths=[2, 3], eos_token_id=99
+            output_tokens, padded_prompt_length=4, eos_token_id=99
         )
-        assert gen_lengths == [2, 1]  # 4-2=2, 4-3=1
+        assert gen_lengths == [2, 1]  # before EOS
 
     def test_no_eos(self):
         output_tokens = torch.tensor([
-            [1, 2, 10, 11, 12, 13],
+            [1, 2, 3, 4, 10, 11, 12, 13],
         ])
         gen_lengths = extract_generation_lengths(
-            output_tokens, prompt_lengths=[2], eos_token_id=99
+            output_tokens, padded_prompt_length=4, eos_token_id=99
         )
-        assert gen_lengths == [4]  # 6-2=4, no EOS found
+        assert gen_lengths == [4]  # full generated length
+
+
+class TestRegisterLayerHooks:
+    def test_hooks_capture_output(self):
+        # Simple sequential model with named layers
+        import torch.nn as nn
+        model = nn.Sequential()
+        model.add_module("layer_0", nn.Linear(4, 4))
+        model.add_module("layer_1", nn.Linear(4, 4))
+
+        captured = {}
+        hooks = register_layer_hooks(model, layer_indices=[0, 1], captured=captured,
+                                     layer_accessor=lambda m, i: list(m.children())[i])
+        x = torch.randn(2, 4)
+        model(x)
+        assert 0 in captured
+        assert 1 in captured
+        assert captured[0].shape == (2, 4)
+        remove_hooks(hooks)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `pytest tests/test_batch_generate.py -v`
+Run: `pytest tests/test_hf_model.py -v`
 Expected: FAIL with ModuleNotFoundError
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/batch_generate.py
-# ABOUTME: Batched prompt preparation and generation result extraction for H200 GPUs.
-# ABOUTME: Handles left-padding, attention masks, and post-hoc EOS detection.
+# src/hf_model.py
+# ABOUTME: HuggingFace model loading, batched tokenization, and hooked forward pass.
+# ABOUTME: Registers forward hooks on selected decoder layers to capture residual streams.
 
 import torch
-from src.fractional import find_eos_position
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from src.config import MODEL_NAME, SELECTED_LAYERS
 
 
-def pad_prompts_left(
-    token_lists: list[torch.Tensor],
-    pad_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Left-pad a list of token tensors to the same length.
+def load_hf_model(device: str = "cuda"):
+    """Load Gemma 2 2B-it with HuggingFace."""
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map=device,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    return model, tokenizer
 
-    Returns:
-        padded: [batch, max_len] padded token tensor
-        attention_mask: [batch, max_len] binary mask (1 = real token, 0 = pad)
-        prompt_lengths: list of original lengths per sequence
-    """
-    prompt_lengths = [len(t) for t in token_lists]
-    max_len = max(prompt_lengths)
 
-    padded = torch.full((len(token_lists), max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros(len(token_lists), max_len, dtype=torch.long)
-
-    for i, tokens in enumerate(token_lists):
-        pad_len = max_len - len(tokens)
-        padded[i, pad_len:] = tokens
-        attention_mask[i, pad_len:] = 1
-
-    return padded, attention_mask, prompt_lengths
+def tokenize_batch(tokenizer, prompts: list[str]) -> dict:
+    """Tokenize a batch of prompts with left-padding."""
+    return tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    )
 
 
 def extract_generation_lengths(
     output_tokens: torch.Tensor,
-    prompt_lengths: list[int],
+    padded_prompt_length: int,
     eos_token_id: int,
 ) -> list[int]:
     """Find actual generation length for each sequence in a batch.
 
-    Scans for the first EOS token after the prompt in each sequence.
-    Returns generation length (not including prompt) per sequence.
+    After left-padded batched generation, all generated tokens start at
+    padded_prompt_length (which is max_prompt_length in the batch).
     """
     batch_size = output_tokens.shape[0]
     gen_lengths = []
     for i in range(batch_size):
-        eos_pos = find_eos_position(
-            output_tokens[i], eos_token_id, prompt_lengths[i]
-        )
-        gen_lengths.append(eos_pos - prompt_lengths[i])
+        generated = output_tokens[i, padded_prompt_length:]
+        eos_positions = (generated == eos_token_id).nonzero(as_tuple=True)[0]
+        if len(eos_positions) > 0:
+            gen_lengths.append(eos_positions[0].item())
+        else:
+            gen_lengths.append(len(generated))
     return gen_lengths
+
+
+def register_layer_hooks(
+    model,
+    layer_indices: list[int],
+    captured: dict,
+    layer_accessor=None,
+) -> list:
+    """Register forward hooks on selected decoder layers.
+
+    The hook captures the layer's output (residual stream post-layer).
+    For Gemma 2: model.model.layers[i] is the i-th decoder layer.
+
+    Args:
+        model: the model (HuggingFace or nn.Module)
+        layer_indices: which layers to hook
+        captured: dict to store captured tensors {layer_idx: tensor}
+        layer_accessor: function(model, idx) -> module. Defaults to Gemma 2 structure.
+
+    Returns:
+        list of hook handles (call remove_hooks() when done)
+    """
+    if layer_accessor is None:
+        layer_accessor = lambda m, i: m.model.layers[i]
+
+    def make_hook(layer_idx):
+        def hook_fn(module, input, output):
+            # Gemma 2 decoder layer returns (hidden_states, ...) tuple
+            if isinstance(output, tuple):
+                captured[layer_idx] = output[0].detach()
+            else:
+                captured[layer_idx] = output.detach()
+        return hook_fn
+
+    hooks = []
+    for idx in layer_indices:
+        layer_module = layer_accessor(model, idx)
+        handle = layer_module.register_forward_hook(make_hook(idx))
+        hooks.append(handle)
+
+    return hooks
+
+
+def remove_hooks(hooks: list):
+    """Remove all registered hooks."""
+    for handle in hooks:
+        handle.remove()
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `pytest tests/test_batch_generate.py -v`
+Run: `pytest tests/test_hf_model.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/batch_generate.py tests/test_batch_generate.py
-git commit -m "feat: add batched prompt preparation and generation length extraction"
+git add src/hf_model.py tests/test_hf_model.py
+git commit -m "feat: add HuggingFace model loading with batched tokenization and layer hooks"
 ```
 
 ---
@@ -415,7 +474,6 @@ class TestEncodeAtFractions:
         sae = MagicMock()
         sae.device = torch.device("cpu")
         def fake_encode(x):
-            # Return sparse-ish features: first few dims active
             out = torch.zeros(x.shape[0], output_dim)
             out[:, 0] = 1.0
             out[:, 1] = 0.5
@@ -425,28 +483,26 @@ class TestEncodeAtFractions:
 
     def test_output_structure(self):
         sae = self._make_mock_sae(100)
-        residuals = {12: torch.randn(50, 64)}  # 50 tokens, dim 64
-        fraction_indices = [4, 9, 14, 19, 24]  # 5 fractions
-        result = encode_at_fractions(sae, residuals, layer=12, fraction_indices=fraction_indices)
+        residual = torch.randn(50, 64)  # 50 tokens, dim 64
+        fraction_indices = [4, 9, 14, 19, 24]
+        result = encode_at_fractions(sae, residual, fraction_indices)
         assert len(result) == 5
         for entry in result:
             assert "indices" in entry
             assert "values" in entry
 
-    def test_correct_positions_sampled(self):
+    def test_correct_number_of_positions(self):
         sae = self._make_mock_sae(100)
-        # Make residuals with distinct values at each position
-        residuals = {12: torch.zeros(20, 64)}
-        residuals[12][10, 0] = 99.0  # mark position 10
-        fraction_indices = [10]
-        result = encode_at_fractions(sae, residuals, layer=12, fraction_indices=fraction_indices)
-        assert len(result) == 1
+        residual = torch.randn(20, 64)
+        fraction_indices = [5, 10, 15]
+        result = encode_at_fractions(sae, residual, fraction_indices)
+        assert len(result) == 3
 
     def test_sparse_output(self):
         sae = self._make_mock_sae(100)
-        residuals = {12: torch.randn(50, 64)}
+        residual = torch.randn(50, 64)
         fraction_indices = [24]
-        result = encode_at_fractions(sae, residuals, layer=12, fraction_indices=fraction_indices)
+        result = encode_at_fractions(sae, residual, fraction_indices)
         # Mock SAE produces 2 nonzero values
         assert result[0]["indices"].shape[0] == 2
         assert result[0]["values"].shape[0] == 2
@@ -470,34 +526,27 @@ from src.fractional import to_sparse_features
 
 def encode_at_fractions(
     sae,
-    residuals: dict[int, torch.Tensor],
-    layer: int,
+    residual: torch.Tensor,
     fraction_indices: list[int],
 ) -> list[dict]:
     """Encode residual stream through SAE at specific token positions.
 
     Args:
         sae: loaded SAE model
-        residuals: {layer: [seq_len, hidden_dim]} residual stream tensors
-        layer: which layer to extract from residuals
-        fraction_indices: token positions to encode (absolute indices into sequence)
+        residual: [seq_len, hidden_dim] residual stream tensor for one layer
+        fraction_indices: absolute token positions to encode
 
     Returns:
         list of sparse feature dicts, one per fraction index
     """
-    layer_residuals = residuals[layer]
     positions = torch.tensor(fraction_indices, dtype=torch.long)
-    selected = layer_residuals[positions]  # [n_fractions, hidden_dim]
+    selected = residual[positions]  # [n_fractions, hidden_dim]
 
     with torch.no_grad():
         features = sae.encode(selected.to(sae.device))  # [n_fractions, n_features]
     features = features.cpu()
 
-    sparse_list = []
-    for i in range(features.shape[0]):
-        sparse_list.append(to_sparse_features(features[i]))
-
-    return sparse_list
+    return [to_sparse_features(features[i]) for i in range(features.shape[0])]
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -514,7 +563,7 @@ git commit -m "feat: add SAE encoding at fractional positions with sparse output
 
 ---
 
-### Task 5: Linear Classifier and AUC Computation
+### Task 5: Linear Classifier with GroupKFold
 
 **Files:**
 - Create: `src/classifier.py`
@@ -525,7 +574,7 @@ git commit -m "feat: add SAE encoding at fractional positions with sparse output
 ```python
 # tests/test_classifier.py
 # ABOUTME: Tests for linear classifier training and AUC curve computation.
-# ABOUTME: Uses synthetic data to validate cross-validation and per-fraction evaluation.
+# ABOUTME: Validates GroupKFold cross-validation and per-fraction evaluation.
 
 import pytest
 import numpy as np
@@ -533,17 +582,27 @@ from src.classifier import (
     tune_regularization,
     train_classifier,
     compute_auc_per_fraction,
+    compute_bootstrap_ci,
 )
 
 
 class TestTuneRegularization:
     def test_returns_best_C(self):
         rng = np.random.RandomState(42)
-        # Linearly separable data
         X = np.vstack([rng.randn(100, 10) + 1, rng.randn(100, 10) - 1])
         y = np.array([0] * 100 + [1] * 100)
-        best_C = tune_regularization(X, y, n_folds=5)
+        groups = np.array([i // 2 for i in range(200)])  # 100 groups of 2
+        best_C = tune_regularization(X, y, groups, n_folds=5)
         assert isinstance(best_C, float)
+        assert best_C > 0
+
+    def test_groups_respected(self):
+        rng = np.random.RandomState(42)
+        # 10 groups, 20 samples each
+        X = np.vstack([rng.randn(20, 5) + (i % 2) * 3 for i in range(10)])
+        y = np.array([i % 2 for i in range(10) for _ in range(20)])
+        groups = np.array([i for i in range(10) for _ in range(20)])
+        best_C = tune_regularization(X, y, groups, n_folds=5)
         assert best_C > 0
 
 
@@ -553,59 +612,44 @@ class TestTrainClassifier:
         X = np.vstack([rng.randn(50, 10) + 2, rng.randn(50, 10) - 2])
         y = np.array([0] * 50 + [1] * 50)
         clf = train_classifier(X, y, C=1.0)
-        preds = clf.predict(X)
-        accuracy = (preds == y).mean()
+        accuracy = (clf.predict(X) == y).mean()
         assert accuracy > 0.9
 
 
 class TestComputeAucPerFraction:
     def test_returns_correct_shape(self):
         rng = np.random.RandomState(42)
-        n_questions = 20
+        n_samples = 40
         n_fractions = 5
         n_features = 10
-        # features_by_fraction: {fraction_idx: {question_id: feature_vector}}
+        # features_by_fraction: {fraction_idx: np.ndarray [n_samples, n_features]}
         features_by_fraction = {}
-        labels = {}
+        y = np.array([i % 2 for i in range(n_samples)])
         for f in range(n_fractions):
-            features_by_fraction[f] = {}
-            for q in range(n_questions):
-                label = q % 2  # alternating labels
-                offset = 2.0 if label == 1 else -2.0
-                features_by_fraction[f][q] = rng.randn(n_features) + offset
-                labels[q] = label
+            X = rng.randn(n_samples, n_features) + (y * 4)[:, None]
+            features_by_fraction[f] = X
 
-        clf = train_classifier(
-            np.vstack([features_by_fraction[0][q] for q in range(n_questions)]),
-            np.array([labels[q] for q in range(n_questions)]),
-            C=1.0,
-        )
-        auc_curve = compute_auc_per_fraction(
-            clf, features_by_fraction, labels, n_fractions
-        )
+        clf = train_classifier(features_by_fraction[0], y, C=1.0)
+        auc_curve = compute_auc_per_fraction(clf, features_by_fraction, y, n_fractions)
         assert len(auc_curve) == n_fractions
         assert all(0.0 <= a <= 1.0 for a in auc_curve)
 
-    def test_separable_data_high_auc(self):
-        rng = np.random.RandomState(42)
-        n_questions = 50
-        n_fractions = 3
-        n_features = 10
-        features_by_fraction = {}
-        labels = {}
-        for f in range(n_fractions):
-            features_by_fraction[f] = {}
-            for q in range(n_questions):
-                label = q % 2
-                offset = 5.0 if label == 1 else -5.0
-                features_by_fraction[f][q] = rng.randn(n_features) + offset
-                labels[q] = label
 
-        X_train = np.vstack([features_by_fraction[0][q] for q in range(n_questions)])
-        y_train = np.array([labels[q] for q in range(n_questions)])
-        clf = train_classifier(X_train, y_train, C=1.0)
-        auc_curve = compute_auc_per_fraction(clf, features_by_fraction, labels, n_fractions)
-        assert all(a > 0.9 for a in auc_curve)
+class TestBootstrapCI:
+    def test_returns_lower_upper(self):
+        rng = np.random.RandomState(42)
+        values_a = [0.7 + rng.randn() * 0.05 for _ in range(20)]
+        values_b = [0.5 + rng.randn() * 0.05 for _ in range(20)]
+        question_ids = list(range(20))
+        lower, upper = compute_bootstrap_ci(values_a, values_b, question_ids)
+        assert lower < upper
+
+    def test_identical_values_ci_near_zero(self):
+        values = [0.6] * 20
+        question_ids = list(range(20))
+        lower, upper = compute_bootstrap_ci(values, values, question_ids)
+        assert abs(lower) < 0.1
+        assert abs(upper) < 0.1
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -618,40 +662,35 @@ Expected: FAIL with ModuleNotFoundError
 ```python
 # src/classifier.py
 # ABOUTME: L2-regularized logistic regression for distinguishing hint conditions.
-# ABOUTME: Includes CV-based regularization tuning and per-fraction AUC evaluation.
+# ABOUTME: Includes GroupKFold CV for regularization tuning and bootstrap CI for onset detection.
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, GroupKFold
 from sklearn.metrics import roc_auc_score
 
 
 def tune_regularization(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
     n_folds: int = 5,
     C_values: list[float] | None = None,
 ) -> float:
-    """Find the best L2 regularization strength via cross-validation.
+    """Find the best L2 regularization strength via GroupKFold cross-validation.
 
-    Args:
-        X: [n_samples, n_features] training features
-        y: [n_samples] binary labels
-        n_folds: number of CV folds
-        C_values: regularization strengths to try (inverse of lambda)
-
-    Returns:
-        best C value
+    Groups ensure all samples from the same question stay in the same fold.
     """
     if C_values is None:
         C_values = [0.001, 0.01, 0.1, 1.0, 10.0]
 
+    gkf = GroupKFold(n_splits=n_folds)
     best_C = C_values[0]
     best_score = -1.0
 
     for C in C_values:
         clf = LogisticRegression(C=C, penalty="l2", solver="lbfgs", max_iter=1000)
-        scores = cross_val_score(clf, X, y, cv=n_folds, scoring="roc_auc")
+        scores = cross_val_score(clf, X, y, cv=gkf, groups=groups, scoring="roc_auc")
         mean_score = scores.mean()
         if mean_score > best_score:
             best_score = mean_score
@@ -673,16 +712,16 @@ def train_classifier(
 
 def compute_auc_per_fraction(
     clf: LogisticRegression,
-    features_by_fraction: dict[int, dict[int, np.ndarray]],
-    labels: dict[int, int],
+    features_by_fraction: dict[int, np.ndarray],
+    y: np.ndarray,
     n_fractions: int,
 ) -> list[float]:
     """Compute AUC at each fractional position using a trained classifier.
 
     Args:
         clf: trained classifier
-        features_by_fraction: {fraction_idx: {question_id: feature_vector}}
-        labels: {question_id: label}
+        features_by_fraction: {fraction_idx: np.ndarray [n_samples, n_features]}
+        y: [n_samples] binary labels, same ordering as feature arrays
         n_fractions: number of fraction points
 
     Returns:
@@ -690,14 +729,43 @@ def compute_auc_per_fraction(
     """
     auc_curve = []
     for f in range(n_fractions):
-        fraction_data = features_by_fraction[f]
-        question_ids = sorted(fraction_data.keys())
-        X = np.vstack([fraction_data[q] for q in question_ids])
-        y = np.array([labels[q] for q in question_ids])
+        X = features_by_fraction[f]
         probs = clf.predict_proba(X)[:, 1]
         auc = roc_auc_score(y, probs)
         auc_curve.append(auc)
     return auc_curve
+
+
+def compute_bootstrap_ci(
+    auc_values_a: list[float],
+    auc_values_b: list[float],
+    question_ids: list[int],
+    n_bootstrap: int = 1000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Bootstrap confidence interval for the difference in AUC (a - b).
+
+    Resamples at the question level to preserve grouping.
+
+    Returns:
+        (lower, upper) bounds of the CI
+    """
+    rng = np.random.RandomState(seed)
+    diffs = []
+    a = np.array(auc_values_a)
+    b = np.array(auc_values_b)
+    n = len(question_ids)
+
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, size=n, replace=True)
+        diff = a[idx].mean() - b[idx].mean()
+        diffs.append(diff)
+
+    alpha = (1 - ci) / 2
+    lower = np.percentile(diffs, 100 * alpha)
+    upper = np.percentile(diffs, 100 * (1 - alpha))
+    return float(lower), float(upper)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -709,7 +777,7 @@ Expected: PASS
 
 ```bash
 git add src/classifier.py tests/test_classifier.py
-git commit -m "feat: add logistic regression classifier with CV tuning and per-fraction AUC"
+git commit -m "feat: add logistic regression classifier with GroupKFold CV and bootstrap CI"
 ```
 
 ---
@@ -725,45 +793,44 @@ git commit -m "feat: add logistic regression classifier with CV tuning and per-f
 ```python
 # tests/test_text_similarity.py
 # ABOUTME: Tests for text similarity computation at fractional positions.
-# ABOUTME: Validates sentence embedding cosine similarity logic.
+# ABOUTME: Validates token-based truncation and embedding cosine similarity.
 
 import pytest
 from src.text_similarity import (
-    text_at_fraction,
+    text_at_token_fraction,
     compute_text_similarity_curve,
 )
 
 
-class TestTextAtFraction:
+class TestTextAtTokenFraction:
     def test_half_fraction(self):
-        text = "one two three four five six seven eight nine ten"
-        result = text_at_fraction(text, 0.5)
-        words = result.split()
-        assert len(words) <= 6  # roughly half
+        tokens = ["one", "two", "three", "four", "five", "six"]
+        result = text_at_token_fraction(tokens, 0.5)
+        assert result == "one two three"
 
     def test_full_fraction(self):
-        text = "hello world"
-        result = text_at_fraction(text, 1.0)
-        assert result == text
+        tokens = ["hello", "world"]
+        result = text_at_token_fraction(tokens, 1.0)
+        assert result == "hello world"
 
     def test_small_fraction(self):
-        text = "a b c d e f g h i j"
-        result = text_at_fraction(text, 0.1)
-        assert len(result) > 0
+        tokens = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+        result = text_at_token_fraction(tokens, 0.1)
+        assert len(result) > 0  # at least 1 token
 
 
 class TestComputeTextSimilarityCurve:
     def test_identical_texts_high_similarity(self):
-        text_a = "The answer is clearly option B because of the evidence."
-        text_b = "The answer is clearly option B because of the evidence."
+        text_a = "The answer is clearly option B because of the evidence presented."
+        text_b = "The answer is clearly option B because of the evidence presented."
         fractions = [0.5, 1.0]
         curve = compute_text_similarity_curve(text_a, text_b, fractions)
         assert len(curve) == 2
         assert all(s > 0.99 for s in curve)
 
     def test_different_texts_lower_similarity(self):
-        text_a = "I think the answer is B based on scientific evidence."
-        text_b = "The professor suggested C so I will go with that."
+        text_a = "I think the answer is B based on scientific evidence and reasoning."
+        text_b = "The professor suggested C so I will go with that recommendation."
         fractions = [0.5, 1.0]
         curve = compute_text_similarity_curve(text_a, text_b, fractions)
         assert len(curve) == 2
@@ -780,16 +847,25 @@ Expected: FAIL with ModuleNotFoundError
 ```python
 # src/text_similarity.py
 # ABOUTME: Computes text-level cosine similarity between generation conditions at fractional positions.
-# ABOUTME: Uses sentence-transformers for embedding-based similarity as a baseline control.
+# ABOUTME: Uses sentence-transformers for semantic embedding similarity as a baseline control.
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+_model = None
 
 
-def text_at_fraction(text: str, fraction: float) -> str:
-    """Extract the first `fraction` of a text by character count."""
-    end = max(1, int(len(text) * fraction))
-    return text[:end]
+def _get_embed_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
+
+
+def text_at_token_fraction(tokens: list[str], fraction: float) -> str:
+    """Extract the first `fraction` of a token list, joined as text."""
+    n = max(1, int(len(tokens) * fraction))
+    return " ".join(tokens[:n])
 
 
 def compute_text_similarity_curve(
@@ -799,22 +875,27 @@ def compute_text_similarity_curve(
 ) -> list[float]:
     """Compute cosine similarity between two texts at each fractional position.
 
-    Uses TF-IDF vectors for simplicity and to avoid loading a separate model.
+    Truncates by token count (whitespace-split) to align with SAE fractional positions.
+    Uses sentence-transformers for semantic similarity.
     """
-    similarities = []
-    vectorizer = TfidfVectorizer()
+    model = _get_embed_model()
+    tokens_a = text_a.split()
+    tokens_b = text_b.split()
 
+    similarities = []
     for frac in fractions:
-        prefix_a = text_at_fraction(text_a, frac)
-        prefix_b = text_at_fraction(text_b, frac)
+        prefix_a = text_at_token_fraction(tokens_a, frac)
+        prefix_b = text_at_token_fraction(tokens_b, frac)
 
         if not prefix_a.strip() or not prefix_b.strip():
             similarities.append(1.0)
             continue
 
-        tfidf = vectorizer.fit_transform([prefix_a, prefix_b])
-        sim = sklearn_cosine(tfidf[0:1], tfidf[1:2])[0, 0]
-        similarities.append(float(sim))
+        embeddings = model.encode([prefix_a, prefix_b])
+        cos_sim = np.dot(embeddings[0], embeddings[1]) / (
+            np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1])
+        )
+        similarities.append(float(cos_sim))
 
     return similarities
 ```
@@ -828,7 +909,7 @@ Expected: PASS
 
 ```bash
 git add src/text_similarity.py tests/test_text_similarity.py
-git commit -m "feat: add text similarity baseline using TF-IDF cosine similarity"
+git commit -m "feat: add text similarity baseline using sentence-transformers"
 ```
 
 ---
@@ -874,7 +955,7 @@ class TestSplitIntoChunks:
 class TestBuildRunMetadata:
     def test_structure(self):
         meta = build_run_metadata(
-            run_id="q001_authority_false_hint",
+            run_id="q00001_authority_false_hint",
             question_idx=1,
             hint_format="authority",
             condition="false_hint",
@@ -885,9 +966,24 @@ class TestBuildRunMetadata:
             prompt_length=50,
             gen_length=100,
         )
-        assert meta["run_id"] == "q001_authority_false_hint"
-        assert meta["hint_following"] is True  # predicted == false_answer
+        assert meta["run_id"] == "q00001_authority_false_hint"
+        assert meta["hint_following"] is True
         assert meta["gen_length"] == 100
+
+    def test_no_hint_following(self):
+        meta = build_run_metadata(
+            run_id="q00001_no_hint",
+            question_idx=1,
+            hint_format="none",
+            condition="no_hint",
+            correct_answer=2,
+            false_answer=0,
+            predicted=2,
+            response="The answer is C.",
+            prompt_length=50,
+            gen_length=80,
+        )
+        assert meta["hint_following"] is False
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -900,27 +996,27 @@ Expected: FAIL with ModuleNotFoundError
 ```python
 # scripts/run_divergence_generation.py
 # ABOUTME: Phase 1 of divergence localization — generates CoT under all conditions.
-# ABOUTME: Batched generation with SAE encoding at fractional positions, SLURM array job.
+# ABOUTME: HuggingFace batched generation with forward hooks for SAE encoding at fractional positions.
 
 import json
 import os
-import sys
 import torch
 from tqdm import tqdm
 from datasets import load_dataset
 
 from src.config import (
-    MMLU_DATASET, MMLU_SPLIT, HINT_FORMATS, ANSWER_LETTERS,
-    MAX_NEW_TOKENS, SELECTED_LAYERS, SAE_WIDTHS, N_FRACTIONS,
-    DIVERGENCE_DIR,
+    MMLU_DATASET, MMLU_SPLIT, HINT_FORMATS, MAX_NEW_TOKENS,
+    SELECTED_LAYERS, SAE_WIDTHS, N_FRACTIONS, DIVERGENCE_DIR, BATCH_SIZE,
 )
 from src.data import (
-    build_prompt, format_for_model, insert_hint, parse_answer,
-    check_mentions_hint, format_choices,
+    build_prompt, format_for_model, insert_hint, parse_answer, check_mentions_hint,
 )
-from src.generate import load_model, pick_false_answer
+from src.generate import pick_false_answer
 from src.sae_analysis import load_sae
-from src.batch_generate import pad_prompts_left, extract_generation_lengths
+from src.hf_model import (
+    load_hf_model, tokenize_batch, extract_generation_lengths,
+    register_layer_hooks, remove_hooks,
+)
 from src.fractional import compute_fraction_indices
 from src.fractional_sae import encode_at_fractions
 
@@ -932,16 +1028,9 @@ def split_into_chunks(items: list, n_chunks: int) -> list[list]:
 
 
 def build_run_metadata(
-    run_id: str,
-    question_idx: int,
-    hint_format: str,
-    condition: str,
-    correct_answer: int,
-    false_answer: int,
-    predicted: int | None,
-    response: str,
-    prompt_length: int,
-    gen_length: int,
+    run_id, question_idx, hint_format, condition,
+    correct_answer, false_answer, predicted, response,
+    prompt_length, gen_length,
 ) -> dict:
     """Assemble metadata for a single generation run."""
     return {
@@ -960,86 +1049,104 @@ def build_run_metadata(
     }
 
 
-def process_batch(
+def generate_batch(model, tokenizer, prompts, batch_size):
+    """Batched text generation without activation caching. Returns (output_tokens, padded_prompt_length)."""
+    encoded = tokenize_batch(tokenizer, prompts)
+    input_ids = encoded["input_ids"].to(model.device)
+    attention_mask = encoded["attention_mask"].to(model.device)
+    padded_prompt_length = input_ids.shape[1]
+
+    with torch.no_grad():
+        output_tokens = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=0.0,
+            do_sample=False,
+        )
+
+    return output_tokens, padded_prompt_length
+
+
+def forward_with_hooks(model, input_ids, attention_mask, captured):
+    """Run forward pass with hooks already registered. Populates captured dict."""
+    with torch.no_grad():
+        model(input_ids=input_ids, attention_mask=attention_mask)
+
+
+def process_batch_with_sae(
     model, tokenizer, saes, prompts_info, batch_size,
 ):
-    """Process a batch of prompts: generate, cache activations, encode SAE features.
+    """Generate text, run hooked forward pass, encode SAE features at fractional positions.
 
-    Args:
-        model: HookedTransformer model
-        tokenizer: model tokenizer
-        saes: dict of {(layer, width_k): sae} pre-loaded SAEs
-        prompts_info: list of dicts with 'formatted_prompt' and metadata fields
-        batch_size: max batch size
-
-    Returns:
-        list of result dicts with metadata and sparse SAE features
+    Two-step process:
+    1. Batched generation (no hooks needed)
+    2. Batched forward pass with hooks to capture residual streams at selected layers
+    Then SAE encode at fractional positions per sequence.
     """
     results = []
 
     for batch_start in range(0, len(prompts_info), batch_size):
         batch = prompts_info[batch_start:batch_start + batch_size]
+        prompts = [info["formatted_prompt"] for info in batch]
 
-        # Tokenize and pad
-        token_lists = [
-            model.to_tokens(info["formatted_prompt"], prepend_bos=False)[0]
-            for info in batch
-        ]
-        pad_token_id = tokenizer.pad_token_id or 0
-        padded, attention_mask, prompt_lengths = pad_prompts_left(token_lists, pad_token_id)
-        padded = padded.to(model.cfg.device)
-
-        # Generate
-        output_tokens = model.generate(
-            padded,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=0.0,
+        # Step 1: Generate
+        output_tokens, padded_prompt_length = generate_batch(
+            model, tokenizer, prompts, batch_size
         )
 
-        # Find actual generation lengths
+        # Get generation lengths
         eos_token_id = tokenizer.eos_token_id or 1
         gen_lengths = extract_generation_lengths(
-            output_tokens, prompt_lengths, eos_token_id
+            output_tokens, padded_prompt_length, eos_token_id
         )
 
-        # Forward pass to cache selected layers
-        layer_filter = lambda name: any(
-            f"blocks.{l}.hook_resid_post" in name for l in SELECTED_LAYERS
-        )
-        _, cache = model.run_with_cache(
-            output_tokens.clone(),
-            names_filter=layer_filter,
-        )
+        # Step 2: Forward pass with hooks
+        captured = {}
+        hooks = register_layer_hooks(model, SELECTED_LAYERS, captured)
 
-        # Process each sequence in the batch
+        # Build attention mask for the full output sequence
+        full_attention_mask = torch.ones_like(output_tokens)
+        # Left-pad region was padding — reconstruct mask
+        encoded = tokenize_batch(tokenizer, prompts)
+        orig_mask = encoded["attention_mask"].to(model.device)
+        # The output has shape [batch, padded_prompt_len + max_new_tokens]
+        # First padded_prompt_len positions keep the original mask
+        full_attention_mask[:, :padded_prompt_length] = orig_mask
+        # Mask out tokens after EOS for each sequence
+        for i in range(len(batch)):
+            eos_abs = padded_prompt_length + gen_lengths[i]
+            if eos_abs < output_tokens.shape[1]:
+                full_attention_mask[i, eos_abs:] = 0
+
+        forward_with_hooks(model, output_tokens, full_attention_mask, captured)
+        remove_hooks(hooks)
+
+        # Step 3: Process each sequence
         for i, info in enumerate(batch):
-            prompt_len = prompt_lengths[i]
             gen_len = max(gen_lengths[i], 1)
 
             # Decode generated text
-            gen_tokens = output_tokens[i, prompt_len:prompt_len + gen_len]
+            gen_start = padded_prompt_length
+            gen_tokens = output_tokens[i, gen_start:gen_start + gen_len]
             response = tokenizer.decode(gen_tokens, skip_special_tokens=True)
             predicted = parse_answer(response)
 
-            # Compute fraction indices
+            # Compute fraction indices (absolute positions in full sequence)
             fraction_indices = compute_fraction_indices(
-                gen_length=gen_len, n_fractions=N_FRACTIONS, prompt_length=prompt_len
+                gen_length=gen_len, n_fractions=N_FRACTIONS,
+                prompt_length=padded_prompt_length,
             )
 
-            # Extract residuals for this sequence
-            residuals = {}
-            for layer in SELECTED_LAYERS:
-                residuals[layer] = cache["resid_post", layer][i].detach()
-
-            # SAE encode at fractional positions
+            # SAE encode at fractional positions per layer
             sae_features = {}
-            for (layer, width_k), sae in saes.items():
-                sparse_list = encode_at_fractions(
-                    sae, residuals, layer=layer, fraction_indices=fraction_indices
-                )
-                sae_features[(layer, width_k)] = sparse_list
+            for layer in SELECTED_LAYERS:
+                residual = captured[layer][i]  # [seq_len, hidden_dim]
+                for width_k in SAE_WIDTHS:
+                    sae = saes[(layer, width_k)]
+                    sparse_list = encode_at_fractions(sae, residual, fraction_indices)
+                    sae_features[f"L{layer}_W{width_k}k"] = sparse_list
 
-            # Build metadata
             meta = build_run_metadata(
                 run_id=info["run_id"],
                 question_idx=info["question_idx"],
@@ -1049,21 +1156,18 @@ def process_batch(
                 false_answer=info["false_answer"],
                 predicted=predicted,
                 response=response,
-                prompt_length=prompt_len,
+                prompt_length=padded_prompt_length,
                 gen_length=gen_len,
             )
-
             results.append({"metadata": meta, "sae_features": sae_features})
 
-        # Clear cache
-        del cache
+        del captured
         torch.cuda.empty_cache()
 
     return results
 
 
 def main():
-    # Determine array task
     task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
     n_tasks = int(os.environ.get("SLURM_ARRAY_TASK_COUNT", "1"))
 
@@ -1076,91 +1180,92 @@ def main():
     print(f"Task {task_id}/{n_tasks}: Loading MMLU...")
     ds = load_dataset(MMLU_DATASET, MMLU_SPLIT, split="test")
     all_questions = [ds[i] for i in range(len(ds))]
-
-    # Split across array tasks
     chunks = split_into_chunks(all_questions, n_tasks)
     my_questions = chunks[task_id]
-    # Compute global index offset
     offset = sum(len(chunks[i]) for i in range(task_id))
-    print(f"Task {task_id}: processing questions {offset} to {offset + len(my_questions) - 1}")
+    print(f"Task {task_id}: questions {offset} to {offset + len(my_questions) - 1}")
 
     # Load model
     print("Loading model...")
-    model = load_model()
-    tokenizer = model.tokenizer
+    model, tokenizer = load_hf_model()
 
-    # Load all SAEs
+    # Phase 1a: Baseline generation (no SAE caching — just find correct answers)
+    print("Running baseline to find correctly-answered questions...")
+    correct_questions = []
+
+    for batch_start in tqdm(range(0, len(my_questions), BATCH_SIZE), desc="Baseline"):
+        batch_qs = my_questions[batch_start:batch_start + BATCH_SIZE]
+        prompts = []
+        for local_idx, q in enumerate(batch_qs):
+            global_idx = offset + batch_start + local_idx
+            user_msg = build_prompt(question=q["question"], choices=q["choices"], hint_text="")
+            prompts.append(format_for_model(tokenizer, user_msg))
+
+        output_tokens, padded_prompt_length = generate_batch(
+            model, tokenizer, prompts, BATCH_SIZE
+        )
+        eos_token_id = tokenizer.eos_token_id or 1
+        gen_lengths = extract_generation_lengths(
+            output_tokens, padded_prompt_length, eos_token_id
+        )
+
+        for i, q in enumerate(batch_qs):
+            global_idx = offset + batch_start + i
+            gen_len = max(gen_lengths[i], 1)
+            gen_tokens = output_tokens[i, padded_prompt_length:padded_prompt_length + gen_len]
+            response = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            predicted = parse_answer(response)
+
+            if predicted == q["answer"]:
+                correct_questions.append({
+                    "global_idx": global_idx,
+                    "question": q,
+                    "false_answer": pick_false_answer(q["answer"], seed=global_idx),
+                    "baseline_response": response,
+                })
+
+    print(f"Task {task_id}: {len(correct_questions)}/{len(my_questions)} correct")
+
+    # Load SAEs for Phase 1b
     print("Loading SAEs...")
     saes = {}
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
             saes[(layer, width_k)] = load_sae(layer, width_k)
 
-    # Phase 1a: Baseline (no-hint) to find correctly answered questions
-    print("Running baseline...")
-    correct_questions = []
-    baseline_metadata = []
-
-    baseline_prompts = []
-    for local_idx, q in enumerate(my_questions):
-        global_idx = offset + local_idx
-        user_msg = build_prompt(question=q["question"], choices=q["choices"], hint_text="")
-        formatted = format_for_model(tokenizer, user_msg)
-        baseline_prompts.append({
-            "formatted_prompt": formatted,
-            "question_idx": global_idx,
-            "local_idx": local_idx,
-            "condition": "no_hint",
-            "hint_format": "none",
-            "correct_answer": q["answer"],
-            "false_answer": pick_false_answer(q["answer"], seed=global_idx),
-            "run_id": f"q{global_idx:05d}_no_hint",
-        })
-
-    baseline_results = process_batch(model, tokenizer, saes, baseline_prompts, BATCH_SIZE)
-
-    for result, prompt_info in zip(baseline_results, baseline_prompts):
-        meta = result["metadata"]
-        baseline_metadata.append(meta)
-        if meta["predicted"] == meta["correct_answer"]:
-            correct_questions.append({
-                "global_idx": prompt_info["question_idx"],
-                "local_idx": prompt_info["local_idx"],
-                "question": my_questions[prompt_info["local_idx"]],
-                "false_answer": meta["false_answer"],
-                "baseline_result": result,
-            })
-
-    print(f"Task {task_id}: {len(correct_questions)}/{len(my_questions)} correct")
-
-    # Phase 1b: Generate hint conditions for correct questions
-    print("Running hint conditions...")
-    all_results = []
-    # Save baseline results for correct questions
-    for cq in correct_questions:
-        all_results.append(cq["baseline_result"])
-
-    hint_prompts = []
+    # Phase 1b: Generate all conditions for correct questions WITH SAE caching
+    print("Running full generation with SAE encoding...")
+    all_prompts = []
     for cq in correct_questions:
         q = cq["question"]
         global_idx = cq["global_idx"]
         correct_idx = q["answer"]
         false_idx = cq["false_answer"]
 
+        # No-hint (with SAE caching this time)
+        user_msg = build_prompt(question=q["question"], choices=q["choices"], hint_text="")
+        all_prompts.append({
+            "formatted_prompt": format_for_model(tokenizer, user_msg),
+            "question_idx": global_idx,
+            "condition": "no_hint",
+            "hint_format": "none",
+            "correct_answer": correct_idx,
+            "false_answer": false_idx,
+            "run_id": f"q{global_idx:05d}_no_hint",
+        })
+
+        # Hint conditions
         for hint_format in HINT_FORMATS:
             for condition in ["true_hint", "false_hint"]:
                 hint_text = insert_hint(
-                    condition=condition,
-                    hint_format=hint_format,
-                    correct_idx=correct_idx,
-                    false_answer_idx=false_idx,
+                    condition=condition, hint_format=hint_format,
+                    correct_idx=correct_idx, false_answer_idx=false_idx,
                 )
                 user_msg = build_prompt(
-                    question=q["question"], choices=q["choices"], hint_text=hint_text
+                    question=q["question"], choices=q["choices"], hint_text=hint_text,
                 )
-                formatted = format_for_model(tokenizer, user_msg)
-                hint_prompts.append({
-                    "formatted_prompt": formatted,
+                all_prompts.append({
+                    "formatted_prompt": format_for_model(tokenizer, user_msg),
                     "question_idx": global_idx,
                     "condition": condition,
                     "hint_format": hint_format,
@@ -1169,8 +1274,7 @@ def main():
                     "run_id": f"q{global_idx:05d}_{hint_format}_{condition}",
                 })
 
-    hint_results = process_batch(model, tokenizer, saes, hint_prompts, BATCH_SIZE)
-    all_results.extend(hint_results)
+    all_results = process_batch_with_sae(model, tokenizer, saes, all_prompts, BATCH_SIZE)
 
     # Save results
     print(f"Saving {len(all_results)} results...")
@@ -1178,18 +1282,11 @@ def main():
     with open(metadata_dir / f"metadata_task{task_id}.json", "w") as f:
         json.dump(all_metadata, f, indent=2)
 
-    # Save SAE features grouped by run
     for result in all_results:
         run_id = result["metadata"]["run_id"]
-        features = {}
-        for (layer, width_k), sparse_list in result["sae_features"].items():
-            features[f"L{layer}_W{width_k}k"] = [
-                {"indices": s["indices"], "values": s["values"]}
-                for s in sparse_list
-            ]
-        torch.save(features, features_dir / f"{run_id}.pt")
+        torch.save(result["sae_features"], features_dir / f"{run_id}.pt")
 
-    print(f"Task {task_id} complete: {len(correct_questions)} questions, {len(all_results)} runs")
+    print(f"Task {task_id} complete: {len(correct_questions)} correct, {len(all_results)} runs saved")
 
 
 if __name__ == "__main__":
@@ -1205,7 +1302,7 @@ Expected: PASS
 
 ```bash
 git add scripts/run_divergence_generation.py tests/test_divergence_generation.py
-git commit -m "feat: add Phase 1 data generation script with batched SAE encoding"
+git commit -m "feat: add Phase 1 data generation with HuggingFace batching and SAE hooks"
 ```
 
 ---
@@ -1221,37 +1318,40 @@ git commit -m "feat: add Phase 1 data generation script with batched SAE encodin
 ```python
 # tests/test_divergence_analysis.py
 # ABOUTME: Tests for divergence analysis helper functions.
-# ABOUTME: Validates data loading, feature assembly, and AUC curve structure.
+# ABOUTME: Validates feature assembly, onset detection, and sparse-to-dense flow.
 
 import pytest
 import numpy as np
+import torch
+from src.fractional import to_sparse_features
 from scripts.run_divergence_analysis import (
-    assemble_features_by_fraction,
+    build_paired_features,
     compute_divergence_onset,
 )
 
 
-class TestAssembleFeaturesByFraction:
+class TestBuildPairedFeatures:
     def test_output_structure(self):
-        # Simulate loaded data: 3 questions, 2 fractions, 4 features
-        sparse_data = {}
+        # 3 questions, each with no_hint and false_hint sparse features
+        # 2 fractions, 10 features
+        question_data = []
         for q in range(3):
-            sparse_data[q] = {
-                "no_hint": [
-                    {"indices": np.array([0, 1]), "values": np.array([1.0, 2.0])},
-                    {"indices": np.array([2]), "values": np.array([3.0])},
-                ],
-                "false_hint": [
-                    {"indices": np.array([0]), "values": np.array([5.0])},
-                    {"indices": np.array([1, 3]), "values": np.array([6.0, 7.0])},
-                ],
-            }
-        features, labels = assemble_features_by_fraction(
-            sparse_data, n_fractions=2, n_features=4
+            nh_fracs = [to_sparse_features(torch.randn(10).abs()) for _ in range(2)]
+            fh_fracs = [to_sparse_features(torch.randn(10).abs()) for _ in range(2)]
+            question_data.append({
+                "question_id": q,
+                "no_hint": nh_fracs,
+                "condition": fh_fracs,
+            })
+
+        features_by_fraction, y, groups = build_paired_features(
+            question_data, n_fractions=2, n_features=10
         )
-        assert len(features) == 2  # 2 fractions
-        assert len(features[0]) == 6  # 3 no_hint + 3 false_hint
-        assert len(labels) == 6
+        assert len(features_by_fraction) == 2  # 2 fractions
+        assert features_by_fraction[0].shape == (6, 10)  # 3 nh + 3 fh
+        assert len(y) == 6
+        assert len(groups) == 6
+        assert set(y) == {0, 1}
 
 
 class TestComputeDivergenceOnset:
@@ -1260,7 +1360,7 @@ class TestComputeDivergenceOnset:
         true_auc = [0.50, 0.51, 0.50, 0.52, 0.51, 0.53]
         onset = compute_divergence_onset(false_auc, true_auc, threshold=0.05, sustained=2)
         assert onset is not None
-        assert onset <= 3  # first sustained gap >= 0.05
+        assert onset <= 3
 
     def test_no_onset(self):
         false_auc = [0.51, 0.52, 0.51, 0.52]
@@ -1279,24 +1379,28 @@ Expected: FAIL with ModuleNotFoundError
 ```python
 # scripts/run_divergence_analysis.py
 # ABOUTME: Phase 2 of divergence localization — trains classifiers and computes AUC curves.
-# ABOUTME: Includes true-hint control, text similarity baseline, and visualization.
+# ABOUTME: Includes true-hint control, text similarity baseline, bootstrap CIs, and visualization.
 
 import json
-import glob
 import numpy as np
 import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
+from scipy import sparse as sp
 
 from src.config import (
     DIVERGENCE_DIR, SELECTED_LAYERS, SAE_WIDTHS, N_FRACTIONS,
     FRACTION_POINTS, HINT_FORMATS,
 )
 from src.fractional import from_sparse_features
-from src.classifier import tune_regularization, train_classifier, compute_auc_per_fraction
+from src.classifier import (
+    tune_regularization, train_classifier,
+    compute_auc_per_fraction, compute_bootstrap_ci,
+)
 from src.text_similarity import compute_text_similarity_curve
+from src.data import build_experiment_groups
 
 
 def load_all_metadata(metadata_dir: Path) -> list[dict]:
@@ -1308,57 +1412,52 @@ def load_all_metadata(metadata_dir: Path) -> list[dict]:
     return all_metadata
 
 
-def load_sparse_features(
-    features_dir: Path,
-    run_id: str,
-    layer: int,
-    width_k: int,
-    n_fractions: int,
-) -> list[np.ndarray]:
-    """Load sparse SAE features for a run, returning dense arrays per fraction."""
+def load_run_features(features_dir: Path, run_id: str, layer_width_key: str) -> list[dict]:
+    """Load sparse SAE features for one run at one layer/width."""
     data = torch.load(features_dir / f"{run_id}.pt", weights_only=True)
-    key = f"L{layer}_W{width_k}k"
-    sparse_list = data[key]
-
-    n_features = width_k * 1000
-    dense_list = []
-    for sparse in sparse_list:
-        dense = from_sparse_features(sparse, total_features=n_features)
-        dense_list.append(dense.numpy())
-
-    return dense_list
+    return data[layer_width_key]
 
 
-def assemble_features_by_fraction(
-    sparse_data: dict[int, dict[str, list]],
+def build_paired_features(
+    question_data: list[dict],
     n_fractions: int,
     n_features: int,
-) -> tuple[dict[int, dict[int, np.ndarray]], dict[int, int]]:
-    """Assemble features organized by fraction for classifier evaluation.
+) -> tuple[dict[int, np.ndarray], np.ndarray, np.ndarray]:
+    """Build paired no-hint vs condition feature arrays from sparse data.
+
+    Each question contributes exactly one no-hint and one condition sample.
+    No deduplication needed — each no-hint vector appears once.
 
     Args:
-        sparse_data: {question_id: {"no_hint": [sparse...], condition: [sparse...]}}
+        question_data: list of {question_id, no_hint: [sparse...], condition: [sparse...]}
         n_fractions: number of fraction points
         n_features: total SAE features
 
     Returns:
-        features_by_fraction: {fraction_idx: {sample_id: feature_array}}
-        labels: {sample_id: 0 or 1}
+        features_by_fraction: {fraction_idx: np.ndarray [2*n_questions, n_features]}
+        y: np.ndarray [2*n_questions] binary labels (0=no_hint, 1=condition)
+        groups: np.ndarray [2*n_questions] question IDs for GroupKFold
     """
-    features_by_fraction = {f: {} for f in range(n_fractions)}
-    labels = {}
-    sample_id = 0
+    n_questions = len(question_data)
+    features_by_fraction = {}
+    y = np.zeros(2 * n_questions, dtype=int)
+    groups = np.zeros(2 * n_questions, dtype=int)
 
-    for q_id, conditions in sparse_data.items():
-        for condition_name, sparse_list in conditions.items():
-            label = 0 if condition_name == "no_hint" else 1
-            for f in range(n_fractions):
-                dense = from_sparse_features(sparse_list[f], total_features=n_features)
-                features_by_fraction[f][sample_id] = dense.numpy()
-            labels[sample_id] = label
-            sample_id += 1
+    for f in range(n_fractions):
+        X = np.zeros((2 * n_questions, n_features), dtype=np.float32)
+        for i, qd in enumerate(question_data):
+            nh_dense = from_sparse_features(qd["no_hint"][f], total_features=n_features)
+            cond_dense = from_sparse_features(qd["condition"][f], total_features=n_features)
+            X[2 * i] = nh_dense.numpy()
+            X[2 * i + 1] = cond_dense.numpy()
+            if f == 0:  # only set labels/groups once
+                y[2 * i] = 0
+                y[2 * i + 1] = 1
+                groups[2 * i] = qd["question_id"]
+                groups[2 * i + 1] = qd["question_id"]
+        features_by_fraction[f] = X
 
-    return features_by_fraction, labels
+    return features_by_fraction, y, groups
 
 
 def compute_divergence_onset(
@@ -1370,7 +1469,6 @@ def compute_divergence_onset(
     """Find the earliest fraction where false AUC exceeds true AUC by threshold.
 
     Requires the gap to be sustained for `sustained` consecutive fractions.
-    Returns fraction index, or None if never sustained.
     """
     gaps = [f - t for f, t in zip(false_auc, true_auc)]
     consecutive = 0
@@ -1385,18 +1483,20 @@ def compute_divergence_onset(
 
 
 def plot_auc_curves(
-    false_auc: list[float],
-    true_auc: list[float],
-    fractions: list[float],
-    title: str,
-    save_path: Path,
-    text_sim: list[float] | None = None,
+    false_auc, true_auc, fractions, title, save_path,
+    text_sim=None, ci_lower=None, ci_upper=None,
 ):
-    """Plot AUC(fraction) curves for false-hint and true-hint with optional text baseline."""
+    """Plot AUC(fraction) curves with controls and optional confidence band."""
     fig, ax1 = plt.subplots(figsize=(10, 6))
     ax1.plot(fractions, false_auc, "r-o", label="False-hint vs No-hint", linewidth=2)
     ax1.plot(fractions, true_auc, "b-s", label="True-hint vs No-hint", linewidth=2)
     ax1.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Chance")
+
+    if ci_lower is not None and ci_upper is not None:
+        gap = [f - t for f, t in zip(false_auc, true_auc)]
+        ax1.fill_between(fractions, true_auc, false_auc, alpha=0.15, color="red",
+                         label="AUC gap")
+
     ax1.set_xlabel("Fraction of Generation")
     ax1.set_ylabel("AUC")
     ax1.set_ylim(0.4, 1.05)
@@ -1426,12 +1526,9 @@ def main():
     # Load metadata
     print("Loading metadata...")
     metadata = load_all_metadata(metadata_dir)
-
-    # Organize by question
-    from src.data import build_experiment_groups
     no_hint_by_q, groups = build_experiment_groups(metadata)
 
-    # Identify test/train split
+    # Train/test split by question
     question_ids = sorted(no_hint_by_q.keys())
     n_test = max(1, len(question_ids) // 10)
     rng = np.random.RandomState(42)
@@ -1445,116 +1542,87 @@ def main():
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
             key = f"L{layer}_W{width_k}k"
-            print(f"\n=== {key} ===")
             n_features = width_k * 1000
+            print(f"\n=== {key} ===")
 
-            # Load features for false-hint analysis
-            print("  Loading features (false-hint)...")
-            train_data = {}
-            test_data = {}
+            # Build paired data for false-hint (one no-hint per question, not duplicated)
+            train_pairs_false = []
+            test_pairs_false = []
+            train_pairs_true = []
+            test_pairs_true = []
 
             for q_id in question_ids:
-                nh_entry = no_hint_by_q[q_id]
-                nh_features = load_sparse_features(
-                    features_dir, nh_entry["run_id"], layer, width_k, N_FRACTIONS
-                )
+                nh_entry = no_hint_by_q.get(q_id)
+                if not nh_entry:
+                    continue
+                nh_features = load_run_features(features_dir, nh_entry["run_id"], key)
 
+                # Collect false-hint and true-hint across formats
                 for fmt in HINT_FORMATS:
                     group_key = (q_id, fmt)
-                    if group_key not in groups or "false_hint" not in groups[group_key]:
+                    if group_key not in groups:
                         continue
-                    fh_entry = groups[group_key]["false_hint"]
-                    fh_features = load_sparse_features(
-                        features_dir, fh_entry["run_id"], layer, width_k, N_FRACTIONS
-                    )
 
-                    sample_id_nh = f"{q_id}_{fmt}_nh"
-                    sample_id_fh = f"{q_id}_{fmt}_fh"
-                    target = train_data if q_id in train_ids else test_data
+                    for condition, target_train, target_test in [
+                        ("false_hint", train_pairs_false, test_pairs_false),
+                        ("true_hint", train_pairs_true, test_pairs_true),
+                    ]:
+                        if condition not in groups[group_key]:
+                            continue
+                        cond_entry = groups[group_key][condition]
+                        cond_features = load_run_features(
+                            features_dir, cond_entry["run_id"], key
+                        )
+                        pair = {
+                            "question_id": q_id,
+                            "no_hint": nh_features,
+                            "condition": cond_features,
+                        }
+                        if q_id in train_ids:
+                            target_train.append(pair)
+                        else:
+                            target_test.append(pair)
 
-                    target[sample_id_nh] = {"features": nh_features, "label": 0}
-                    target[sample_id_fh] = {"features": fh_features, "label": 1}
+            # FALSE-HINT analysis
+            print(f"  False-hint: {len(train_pairs_false)} train, {len(test_pairs_false)} test pairs")
+            train_feats, train_y, train_groups = build_paired_features(
+                train_pairs_false, N_FRACTIONS, n_features
+            )
 
-            # Build training arrays
-            print("  Building training data...")
-            X_train_all = []
-            y_train_all = []
-            for sample_id, info in train_data.items():
-                for f in range(N_FRACTIONS):
-                    X_train_all.append(info["features"][f])
-                    y_train_all.append(info["label"])
-            X_train_all = np.vstack(X_train_all)
-            y_train_all = np.array(y_train_all)
+            # Build training array (all fractions pooled)
+            X_train = np.vstack([train_feats[f] for f in range(N_FRACTIONS)])
+            y_train = np.tile(train_y, N_FRACTIONS)
+            g_train = np.tile(train_groups, N_FRACTIONS)
 
-            # Tune regularization
             print("  Tuning regularization...")
-            best_C = tune_regularization(X_train_all, y_train_all)
+            best_C = tune_regularization(X_train, y_train, g_train)
             print(f"  Best C: {best_C}")
 
-            # Train final classifier
             print("  Training classifier...")
-            clf = train_classifier(X_train_all, y_train_all, C=best_C)
+            clf = train_classifier(X_train, y_train, C=best_C)
 
-            # Evaluate per fraction on test set
-            print("  Computing AUC per fraction...")
-            test_features_by_fraction = {f: {} for f in range(N_FRACTIONS)}
-            test_labels = {}
-            for sid, (sample_id, info) in enumerate(test_data.items()):
-                for f in range(N_FRACTIONS):
-                    test_features_by_fraction[f][sid] = info["features"][f]
-                test_labels[sid] = info["label"]
-
-            false_auc = compute_auc_per_fraction(
-                clf, test_features_by_fraction, test_labels, N_FRACTIONS
+            print("  Computing AUC per fraction (false-hint)...")
+            test_feats_false, test_y_false, _ = build_paired_features(
+                test_pairs_false, N_FRACTIONS, n_features
             )
+            false_auc = compute_auc_per_fraction(clf, test_feats_false, test_y_false, N_FRACTIONS)
 
-            # True-hint control
+            # TRUE-HINT control
             print("  Computing true-hint control...")
-            train_data_true = {}
-            test_data_true = {}
-            for q_id in question_ids:
-                nh_entry = no_hint_by_q[q_id]
-                nh_features = load_sparse_features(
-                    features_dir, nh_entry["run_id"], layer, width_k, N_FRACTIONS
-                )
-                for fmt in HINT_FORMATS:
-                    group_key = (q_id, fmt)
-                    if group_key not in groups or "true_hint" not in groups[group_key]:
-                        continue
-                    th_entry = groups[group_key]["true_hint"]
-                    th_features = load_sparse_features(
-                        features_dir, th_entry["run_id"], layer, width_k, N_FRACTIONS
-                    )
+            train_feats_true, train_y_true, train_groups_true = build_paired_features(
+                train_pairs_true, N_FRACTIONS, n_features
+            )
+            X_train_true = np.vstack([train_feats_true[f] for f in range(N_FRACTIONS)])
+            y_train_true = np.tile(train_y_true, N_FRACTIONS)
+            g_train_true = np.tile(train_groups_true, N_FRACTIONS)
 
-                    sample_id_nh = f"{q_id}_{fmt}_nh"
-                    sample_id_th = f"{q_id}_{fmt}_th"
-                    target = train_data_true if q_id in train_ids else test_data_true
-
-                    target[sample_id_nh] = {"features": nh_features, "label": 0}
-                    target[sample_id_th] = {"features": th_features, "label": 1}
-
-            X_train_true = []
-            y_train_true = []
-            for sample_id, info in train_data_true.items():
-                for f in range(N_FRACTIONS):
-                    X_train_true.append(info["features"][f])
-                    y_train_true.append(info["label"])
-            X_train_true = np.vstack(X_train_true)
-            y_train_true = np.array(y_train_true)
-
-            best_C_true = tune_regularization(X_train_true, y_train_true)
+            best_C_true = tune_regularization(X_train_true, y_train_true, g_train_true)
             clf_true = train_classifier(X_train_true, y_train_true, C=best_C_true)
 
-            test_features_true = {f: {} for f in range(N_FRACTIONS)}
-            test_labels_true = {}
-            for sid, (sample_id, info) in enumerate(test_data_true.items()):
-                for f in range(N_FRACTIONS):
-                    test_features_true[f][sid] = info["features"][f]
-                test_labels_true[sid] = info["label"]
-
-            true_auc = compute_auc_per_fraction(
-                clf_true, test_features_true, test_labels_true, N_FRACTIONS
+            test_feats_true, test_y_true, _ = build_paired_features(
+                test_pairs_true, N_FRACTIONS, n_features
             )
+            true_auc = compute_auc_per_fraction(clf_true, test_feats_true, test_y_true, N_FRACTIONS)
 
             # Divergence onset
             onset = compute_divergence_onset(false_auc, true_auc)
@@ -1563,7 +1631,20 @@ def main():
             top_k = 20
             weights = np.abs(clf.coef_[0])
             top_indices = np.argsort(weights)[-top_k:][::-1]
-            top_weights = [(int(idx), float(weights[idx])) for idx in top_indices]
+            top_features = [(int(idx), float(weights[idx])) for idx in top_indices]
+
+            # Per-format AUC on test set (using the false-hint classifier)
+            per_format_auc = {}
+            for fmt in HINT_FORMATS:
+                fmt_test_pairs = [p for p in test_pairs_false
+                                  if any(True for gk in groups
+                                         if gk == (p["question_id"], fmt))]
+                if fmt_test_pairs:
+                    fmt_feats, fmt_y, _ = build_paired_features(
+                        fmt_test_pairs, N_FRACTIONS, n_features
+                    )
+                    fmt_auc = compute_auc_per_fraction(clf, fmt_feats, fmt_y, N_FRACTIONS)
+                    per_format_auc[fmt] = fmt_auc
 
             all_results[key] = {
                 "false_auc": false_auc,
@@ -1571,10 +1652,10 @@ def main():
                 "onset_fraction_idx": onset,
                 "onset_fraction": FRACTION_POINTS[onset] if onset is not None else None,
                 "best_C": best_C,
-                "top_features": top_weights,
+                "top_features": top_features,
+                "per_format_auc": per_format_auc,
             }
 
-            # Plot
             plot_auc_curves(
                 false_auc, true_auc, FRACTION_POINTS,
                 f"AUC Curve — Layer {layer}, {width_k}k SAE",
@@ -1584,7 +1665,11 @@ def main():
             print(f"  True AUC:  {[f'{a:.3f}' for a in true_auc]}")
             print(f"  Onset: {FRACTION_POINTS[onset] if onset is not None else 'none'}")
 
-    # Text similarity baseline (average across test questions)
+            # Free memory
+            del train_feats, test_feats_false, train_feats_true, test_feats_true
+            del X_train, X_train_true
+
+    # Text similarity baseline
     print("\nComputing text similarity baseline...")
     text_sims = []
     for q_id in test_ids:
@@ -1603,7 +1688,7 @@ def main():
 
     avg_text_sim = np.mean(text_sims, axis=0).tolist() if text_sims else [0.0] * N_FRACTIONS
 
-    # Save all results
+    # Save results
     output = {
         "layer_width_results": all_results,
         "text_similarity_baseline": avg_text_sim,
@@ -1614,8 +1699,9 @@ def main():
     with open(results_dir / "divergence_results.json", "w") as f:
         json.dump(output, f, indent=2)
 
-    # Summary plot with text similarity overlay for best layer
-    best_key = min(all_results, key=lambda k: all_results[k]["onset_fraction_idx"] or 999)
+    # Summary plot for best layer
+    best_key = min(all_results, key=lambda k: all_results[k]["onset_fraction_idx"]
+                   if all_results[k]["onset_fraction_idx"] is not None else 999)
     best = all_results[best_key]
     plot_auc_curves(
         best["false_auc"], best["true_auc"], FRACTION_POINTS,
@@ -1624,46 +1710,13 @@ def main():
         text_sim=avg_text_sim,
     )
 
-    # Print summary
+    # Summary
     print("\n=== DIVERGENCE ONSET SUMMARY ===")
     for key in sorted(all_results):
         r = all_results[key]
         onset_str = f"{r['onset_fraction']:.0%}" if r["onset_fraction"] else "none"
         print(f"  {key}: onset at {onset_str}")
 
-    # Per-format AUC breakdown on test set
-    print("\n=== PER-FORMAT AUC (test set, last fraction) ===")
-    for key in sorted(all_results):
-        layer = int(key.split("_")[0][1:])
-        width_str = key.split("_")[1]
-        width_k = int(width_str[1:].replace("k", ""))
-        n_features = width_k * 1000
-        for fmt in HINT_FORMATS:
-            fmt_features = {f: {} for f in range(N_FRACTIONS)}
-            fmt_labels = {}
-            sid = 0
-            for q_id in test_ids:
-                nh_entry = no_hint_by_q.get(q_id)
-                group_key = (q_id, fmt)
-                if not nh_entry or group_key not in groups or "false_hint" not in groups[group_key]:
-                    continue
-                fh_entry = groups[group_key]["false_hint"]
-                nh_feats = load_sparse_features(features_dir, nh_entry["run_id"], layer, width_k, N_FRACTIONS)
-                fh_feats = load_sparse_features(features_dir, fh_entry["run_id"], layer, width_k, N_FRACTIONS)
-                for f in range(N_FRACTIONS):
-                    fmt_features[f][sid] = nh_feats[f]
-                    fmt_features[f][sid + 1] = fh_feats[f]
-                fmt_labels[sid] = 0
-                fmt_labels[sid + 1] = 1
-                sid += 2
-            if fmt_labels:
-                clf = all_results[key].get("_clf")
-                if clf is None:
-                    clf = train_classifier(X_train_all, y_train_all, C=all_results[key]["best_C"])
-                fmt_auc = compute_auc_per_fraction(clf, fmt_features, fmt_labels, N_FRACTIONS)
-                print(f"  {key} {fmt}: AUC@100% = {fmt_auc[-1]:.3f}")
-
-    # Hint-following stats
     total_false = sum(1 for m in metadata if m["condition"] == "false_hint")
     hint_following = sum(1 for m in metadata if m.get("hint_following", False))
     mentions = sum(1 for m in metadata if m.get("mentions_hint", False) and m["condition"] == "false_hint")
@@ -1687,7 +1740,7 @@ Expected: PASS
 
 ```bash
 git add scripts/run_divergence_analysis.py tests/test_divergence_analysis.py
-git commit -m "feat: add Phase 2 classification and AUC analysis script"
+git commit -m "feat: add Phase 2 classification with GroupKFold CV and bootstrap CIs"
 ```
 
 ---
@@ -1711,6 +1764,9 @@ PARTITION_CPU="177huntington"
 CONDA_ENV="cot_sae"
 WORKDIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Create log directory
+mkdir -p "$WORKDIR/outputs/divergence/logs"
+
 echo "Working directory: $WORKDIR"
 echo ""
 
@@ -1733,7 +1789,7 @@ JOB2=$(sbatch --parsable \
     --dependency=afterok:$JOB1 \
     --partition=$PARTITION_CPU \
     --time=02:00:00 \
-    --mem=64G \
+    --mem=256G \
     --job-name=div-analysis \
     --output=$WORKDIR/outputs/divergence/logs/phase2_%j.log \
     --error=$WORKDIR/outputs/divergence/logs/phase2_%j.err \
@@ -1743,7 +1799,6 @@ echo "Phase 2 (analysis):  Job $JOB2 (depends on $JOB1)"
 
 echo ""
 echo "Monitor with: squeue -u \$USER"
-echo "Phase 1 logs: $WORKDIR/outputs/divergence/logs/phase1_${JOB1}_*.log"
 ```
 
 - [ ] **Step 2: Make executable and verify syntax**
@@ -1753,13 +1808,7 @@ chmod +x scripts/launch_divergence.sh
 bash -n scripts/launch_divergence.sh && echo "Syntax OK"
 ```
 
-- [ ] **Step 3: Create logs directory**
-
-```bash
-mkdir -p outputs/divergence/logs
-```
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add scripts/launch_divergence.sh
@@ -1768,37 +1817,46 @@ git commit -m "feat: add SLURM launch script for divergence localization pipelin
 
 ---
 
-### Task 10: Add scikit-learn to Environment
+### Task 10: Add Dependencies to Environment
 
 **Files:**
 - Modify: `environment.yml`
 
-- [ ] **Step 1: Check if scikit-learn is already in environment**
+- [ ] **Step 1: Check current dependencies**
 
-Run: `conda run -n cot_sae python -c "import sklearn; print(sklearn.__version__)"` to check.
+Run: `conda run -n cot_sae python -c "import sklearn; print(sklearn.__version__)"` and
+`conda run -n cot_sae python -c "from sentence_transformers import SentenceTransformer; print('OK')"`
 
-- [ ] **Step 2: Add scikit-learn if missing**
+- [ ] **Step 2: Add missing dependencies**
 
-Add `- scikit-learn` to the pip dependencies in `environment.yml` (or conda dependencies).
+Add to `environment.yml` pip section:
+```yaml
+    - scikit-learn
+    - sentence-transformers
+```
 
 - [ ] **Step 3: Install**
 
-Run: `conda run -n cot_sae pip install scikit-learn`
+```bash
+conda run -n cot_sae pip install scikit-learn sentence-transformers
+```
 
 - [ ] **Step 4: Verify**
 
-Run: `conda run -n cot_sae python -c "from sklearn.linear_model import LogisticRegression; print('OK')"`
+```bash
+conda run -n cot_sae python -c "from sklearn.linear_model import LogisticRegression; from sentence_transformers import SentenceTransformer; print('OK')"
+```
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add environment.yml
-git commit -m "deps: add scikit-learn for logistic regression classifier"
+git commit -m "deps: add scikit-learn and sentence-transformers"
 ```
 
 ---
 
-### Task 11: Integration Test — Full Pipeline Smoke Test
+### Task 11: Integration Test
 
 **Files:**
 - Create: `tests/test_integration_divergence.py`
@@ -1808,84 +1866,63 @@ git commit -m "deps: add scikit-learn for logistic regression classifier"
 ```python
 # tests/test_integration_divergence.py
 # ABOUTME: Smoke test for the full divergence localization pipeline.
-# ABOUTME: Validates end-to-end data flow with tiny synthetic data.
+# ABOUTME: Validates end-to-end data flow with synthetic data.
 
 import pytest
 import numpy as np
 import torch
-from src.fractional import compute_fraction_indices, to_sparse_features, from_sparse_features
+from src.fractional import to_sparse_features, from_sparse_features
 from src.classifier import tune_regularization, train_classifier, compute_auc_per_fraction
-from src.text_similarity import compute_text_similarity_curve
-from scripts.run_divergence_analysis import assemble_features_by_fraction, compute_divergence_onset
+from scripts.run_divergence_analysis import build_paired_features, compute_divergence_onset
 
 
 class TestEndToEndPipeline:
     def test_sparse_to_classifier_flow(self):
-        """Test that sparse features can flow through the full analysis pipeline."""
+        """Sparse features → paired assembly → classifier → AUC curve."""
         n_questions = 30
         n_fractions = 5
         n_features = 100
         rng = np.random.RandomState(42)
 
-        # Simulate sparse features for no_hint and false_hint
-        sparse_data = {}
+        question_data = []
         for q in range(n_questions):
-            nh_fractions = []
-            fh_fractions = []
+            nh_fracs = []
+            cond_fracs = []
             for f in range(n_fractions):
-                # no_hint: features centered around 0
                 nh_dense = torch.zeros(n_features)
                 active = rng.choice(n_features, 5, replace=False)
                 nh_dense[active] = torch.from_numpy(rng.randn(5).astype(np.float32))
-                nh_fractions.append(to_sparse_features(nh_dense))
+                nh_fracs.append(to_sparse_features(nh_dense))
 
-                # false_hint: features shifted positive (increasingly with fraction)
-                fh_dense = torch.zeros(n_features)
-                fh_dense[active] = torch.from_numpy(
+                cond_dense = torch.zeros(n_features)
+                cond_dense[active] = torch.from_numpy(
                     (rng.randn(5) + (f + 1) * 0.5).astype(np.float32)
                 )
-                fh_fractions.append(to_sparse_features(fh_dense))
+                cond_fracs.append(to_sparse_features(cond_dense))
 
-            sparse_data[q] = {"no_hint": nh_fractions, "false_hint": fh_fractions}
+            question_data.append({
+                "question_id": q,
+                "no_hint": nh_fracs,
+                "condition": cond_fracs,
+            })
 
-        # Assemble
-        features_by_fraction, labels = assemble_features_by_fraction(
-            sparse_data, n_fractions=n_fractions, n_features=n_features
+        features_by_fraction, y, groups = build_paired_features(
+            question_data, n_fractions=n_fractions, n_features=n_features
         )
 
-        # Build training arrays
-        X_all = []
-        y_all = []
-        for sample_id in sorted(labels.keys()):
-            for f in range(n_fractions):
-                X_all.append(features_by_fraction[f][sample_id])
-            y_all.extend([labels[sample_id]] * n_fractions)
-        X_all = np.vstack(X_all)
-        y_all = np.array(y_all)
+        X_all = np.vstack([features_by_fraction[f] for f in range(n_fractions)])
+        y_all = np.tile(y, n_fractions)
+        g_all = np.tile(groups, n_fractions)
 
-        # Train and evaluate
-        best_C = tune_regularization(X_all, y_all, n_folds=3)
+        best_C = tune_regularization(X_all, y_all, g_all, n_folds=3)
         clf = train_classifier(X_all, y_all, C=best_C)
-        auc_curve = compute_auc_per_fraction(
-            clf, features_by_fraction, labels, n_fractions
-        )
+        auc_curve = compute_auc_per_fraction(clf, features_by_fraction, y, n_fractions)
 
         assert len(auc_curve) == n_fractions
-        # Later fractions should have higher AUC (signal increases)
         assert auc_curve[-1] >= auc_curve[0]
 
-    def test_text_similarity_integration(self):
-        """Test text similarity across fractions."""
-        text_a = "Let me think step by step about this question carefully."
-        text_b = "The expert said the answer is B so I think it must be B."
-        fractions = [0.25, 0.5, 0.75, 1.0]
-        curve = compute_text_similarity_curve(text_a, text_b, fractions)
-        assert len(curve) == 4
-        assert all(isinstance(s, float) for s in curve)
-
     def test_divergence_onset_detection(self):
-        """Test onset detection with synthetic AUC curves."""
-        # False-hint AUC rises sharply at fraction 3
+        """Onset detection with synthetic AUC curves."""
         false_auc = [0.52, 0.53, 0.55, 0.70, 0.85, 0.90]
         true_auc = [0.51, 0.52, 0.51, 0.52, 0.53, 0.52]
         onset = compute_divergence_onset(false_auc, true_auc, threshold=0.05, sustained=2)
@@ -1914,6 +1951,7 @@ git commit -m "test: add integration test for divergence localization pipeline"
 
 ## Known Limitations
 
-- **TransformerLens batched generation**: The `model.generate()` with batched left-padded inputs requires attention mask support. TransformerLens may need manual attention mask handling — verify during Task 3 implementation and adjust if needed.
-- **SLURM array job count**: `SLURM_ARRAY_TASK_COUNT` may not be available in all SLURM versions. The script falls back to n_tasks=1.
-- **Memory for Phase 2**: Loading all sparse features for ~3,000 questions into RAM should be fine at ~30-50 GB, but may need chunking if the number of correct questions is unexpectedly large.
+- **HuggingFace generate() with attention masks**: Batched generation with left-padding is well-supported for Gemma 2 (tokenizer defaults to `padding_side="left"`). Verify during Task 3 implementation that the attention mask propagates correctly through sliding window attention layers.
+- **No-hint shared across formats but not duplicated**: Each no-hint vector is used once per format pairing in `build_paired_features`, but the same underlying activation is shared. Per-format AUC differences are driven entirely by the hint conditions. This is documented and acceptable.
+- **Phase 2 memory**: `build_paired_features` converts sparse to dense arrays. For 65k width with ~3,000 questions per layer/width: ~3,000 × 2 × 65,536 × 4 bytes ≈ 1.5 GB per fraction, 20 fractions ≈ 30 GB. Fits in 256 GB. Arrays are freed between layer/width iterations.
+- **Text similarity**: Uses whitespace tokenization for truncation, which does not exactly match the model's BPE tokenizer. This is an approximation for the baseline control.

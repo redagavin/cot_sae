@@ -66,11 +66,11 @@ Total forward passes: ~21,000+
 
 ## Model and SAE Configuration
 
-- **Model**: Gemma 2 2B-it (`google/gemma-2-2b-it`), 26 layers, hidden_dim 2304
-- **SAEs**: Gemma Scope 2B base model SAEs, canonical release (`gemma-scope-2b-pt-res-canonical`)
-- **Layers**: 12, 14, 16, 17, 22, 25 (union of top-5 from mean-pool and max-pool in the sweep)
+- **Model**: Gemma 2 2B-it (`google/gemma-2-2b-it`), loaded via HuggingFace transformers (not TransformerLens), 26 layers, hidden_dim 2304
+- **SAEs**: Gemma Scope 2B base model SAEs, canonical release (`gemma-scope-2b-pt-res-canonical`), loaded via SAELens
+- **Layers**: 12, 14, 16, 17, 22, 25 (union of top-5 from mean-pool and max-pool in the sweep). Residual streams captured via forward hooks on decoder layers to avoid final RMSNorm contamination on the last layer.
 - **Widths**: 16k, 65k (both, for comparison)
-- **Generation**: temperature=0 (greedy), MAX_NEW_TOKENS=4096
+- **Generation**: temperature=0 (greedy), MAX_NEW_TOKENS=4096. Batched via HuggingFace `model.generate()` with left-padding and attention masks.
 
 ## Pipeline
 
