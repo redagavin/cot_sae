@@ -376,6 +376,9 @@ def extract_generation_lengths(
 
     After left-padded batched generation, all generated tokens start at
     padded_prompt_length (which is max_prompt_length in the batch).
+
+    gen_length excludes the EOS token, so the 100% fraction point
+    is the token just before EOS.
     """
     batch_size = output_tokens.shape[0]
     gen_lengths = []
@@ -638,16 +641,25 @@ class TestComputeAucPerFraction:
 class TestBootstrapCI:
     def test_returns_lower_upper(self):
         rng = np.random.RandomState(42)
-        values_a = [0.7 + rng.randn() * 0.05 for _ in range(20)]
-        values_b = [0.5 + rng.randn() * 0.05 for _ in range(20)]
-        question_ids = list(range(20))
-        lower, upper = compute_bootstrap_ci(values_a, values_b, question_ids)
+        n = 40
+        probs_false = rng.rand(n)
+        y_false = (probs_false > 0.3).astype(int)
+        probs_true = rng.rand(n) * 0.5
+        y_true = (probs_true > 0.5).astype(int)
+        question_ids = np.array([i // 2 for i in range(n)])
+        lower, upper = compute_bootstrap_ci(
+            probs_false, y_false, probs_true, y_true, question_ids,
+        )
         assert lower < upper
 
-    def test_identical_values_ci_near_zero(self):
-        values = [0.6] * 20
-        question_ids = list(range(20))
-        lower, upper = compute_bootstrap_ci(values, values, question_ids)
+    def test_identical_predictions_ci_near_zero(self):
+        n = 40
+        probs = np.array([0.6] * n)
+        y = np.array([0, 1] * (n // 2))
+        question_ids = np.array([i // 2 for i in range(n)])
+        lower, upper = compute_bootstrap_ci(
+            probs, y, probs, y, question_ids,
+        )
         assert abs(lower) < 0.1
         assert abs(upper) < 0.1
 ```
@@ -737,30 +749,51 @@ def compute_auc_per_fraction(
 
 
 def compute_bootstrap_ci(
-    auc_values_a: list[float],
-    auc_values_b: list[float],
-    question_ids: list[int],
+    probs_false: np.ndarray,
+    y_false: np.ndarray,
+    probs_true: np.ndarray,
+    y_true: np.ndarray,
+    question_ids: np.ndarray,
     n_bootstrap: int = 1000,
     ci: float = 0.95,
     seed: int = 42,
 ) -> tuple[float, float]:
-    """Bootstrap confidence interval for the difference in AUC (a - b).
+    """Bootstrap confidence interval for AUC gap (false-hint AUC minus true-hint AUC).
 
-    Resamples at the question level to preserve grouping.
+    Resamples unique question IDs, gathers all corresponding samples,
+    and recomputes AUC for both conditions per resample.
+
+    Args:
+        probs_false: [n_test] predicted probabilities for false-hint test set
+        y_false: [n_test] binary labels for false-hint
+        probs_true: [n_test] predicted probabilities for true-hint
+        y_true: [n_test] binary labels for true-hint
+        question_ids: [n_test] question IDs for grouping
 
     Returns:
-        (lower, upper) bounds of the CI
+        (lower, upper) bounds of the CI on the AUC gap
     """
     rng = np.random.RandomState(seed)
-    diffs = []
-    a = np.array(auc_values_a)
-    b = np.array(auc_values_b)
-    n = len(question_ids)
+    unique_qids = np.unique(question_ids)
+    n_questions = len(unique_qids)
 
+    # Build index lookup: question_id -> list of sample indices
+    qid_to_idx = {}
+    for idx, qid in enumerate(question_ids):
+        qid_to_idx.setdefault(qid, []).append(idx)
+
+    diffs = []
     for _ in range(n_bootstrap):
-        idx = rng.choice(n, size=n, replace=True)
-        diff = a[idx].mean() - b[idx].mean()
-        diffs.append(diff)
+        sampled_qids = rng.choice(unique_qids, size=n_questions, replace=True)
+        idx_false = np.concatenate([qid_to_idx[q] for q in sampled_qids])
+        idx_true = np.concatenate([qid_to_idx[q] for q in sampled_qids])
+
+        try:
+            auc_f = roc_auc_score(y_false[idx_false], probs_false[idx_false])
+            auc_t = roc_auc_score(y_true[idx_true], probs_true[idx_true])
+            diffs.append(auc_f - auc_t)
+        except ValueError:
+            continue  # skip if a resample has only one class
 
     alpha = (1 - ci) / 2
     lower = np.percentile(diffs, 100 * alpha)
@@ -1050,7 +1083,11 @@ def build_run_metadata(
 
 
 def generate_batch(model, tokenizer, prompts, batch_size):
-    """Batched text generation without activation caching. Returns (output_tokens, padded_prompt_length)."""
+    """Batched text generation without activation caching.
+
+    Returns (output_tokens, padded_prompt_length, prompt_attention_mask).
+    The prompt_attention_mask is saved for reuse in the forward pass.
+    """
     encoded = tokenize_batch(tokenizer, prompts)
     input_ids = encoded["input_ids"].to(model.device)
     attention_mask = encoded["attention_mask"].to(model.device)
@@ -1065,7 +1102,7 @@ def generate_batch(model, tokenizer, prompts, batch_size):
             do_sample=False,
         )
 
-    return output_tokens, padded_prompt_length
+    return output_tokens, padded_prompt_length, attention_mask
 
 
 def forward_with_hooks(model, input_ids, attention_mask, captured):
@@ -1090,8 +1127,8 @@ def process_batch_with_sae(
         batch = prompts_info[batch_start:batch_start + batch_size]
         prompts = [info["formatted_prompt"] for info in batch]
 
-        # Step 1: Generate
-        output_tokens, padded_prompt_length = generate_batch(
+        # Step 1: Generate (also returns the prompt attention mask for reuse)
+        output_tokens, padded_prompt_length, prompt_attention_mask = generate_batch(
             model, tokenizer, prompts, batch_size
         )
 
@@ -1105,14 +1142,10 @@ def process_batch_with_sae(
         captured = {}
         hooks = register_layer_hooks(model, SELECTED_LAYERS, captured)
 
-        # Build attention mask for the full output sequence
+        # Build attention mask for the full output sequence,
+        # reusing the prompt attention mask from generation
         full_attention_mask = torch.ones_like(output_tokens)
-        # Left-pad region was padding — reconstruct mask
-        encoded = tokenize_batch(tokenizer, prompts)
-        orig_mask = encoded["attention_mask"].to(model.device)
-        # The output has shape [batch, padded_prompt_len + max_new_tokens]
-        # First padded_prompt_len positions keep the original mask
-        full_attention_mask[:, :padded_prompt_length] = orig_mask
+        full_attention_mask[:, :padded_prompt_length] = prompt_attention_mask
         # Mask out tokens after EOS for each sequence
         for i in range(len(batch)):
             eos_abs = padded_prompt_length + gen_lengths[i]
@@ -1201,7 +1234,7 @@ def main():
             user_msg = build_prompt(question=q["question"], choices=q["choices"], hint_text="")
             prompts.append(format_for_model(tokenizer, user_msg))
 
-        output_tokens, padded_prompt_length = generate_batch(
+        output_tokens, padded_prompt_length, _ = generate_batch(
             model, tokenizer, prompts, BATCH_SIZE
         )
         eos_token_id = tokenizer.eos_token_id or 1
@@ -1426,7 +1459,10 @@ def build_paired_features(
     """Build paired no-hint vs condition feature arrays from sparse data.
 
     Each question contributes exactly one no-hint and one condition sample.
-    No deduplication needed — each no-hint vector appears once.
+    Each question's no-hint vector is paired once per format. The same no-hint
+    features appear in up to 3 pairings when formats are pooled. This is
+    acceptable because the classifier treats each pairing as an observation,
+    and GroupKFold ensures all pairings from the same question stay together.
 
     Args:
         question_data: list of {question_id, no_hint: [sparse...], condition: [sparse...]}
@@ -1493,9 +1529,18 @@ def plot_auc_curves(
     ax1.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Chance")
 
     if ci_lower is not None and ci_upper is not None:
-        gap = [f - t for f, t in zip(false_auc, true_auc)]
-        ax1.fill_between(fractions, true_auc, false_auc, alpha=0.15, color="red",
-                         label="AUC gap")
+        # Plot confidence band around the AUC gap (centered on true_auc + gap)
+        gap = np.array([f - t for f, t in zip(false_auc, true_auc)])
+        fractions_arr = np.array(fractions)
+        true_arr = np.array(true_auc)
+        # ci_lower/ci_upper are bounds on the gap itself, so the band is
+        # true_auc + ci_lower to true_auc + ci_upper
+        ax1.fill_between(
+            fractions_arr,
+            true_arr + np.array(ci_lower),
+            true_arr + np.array(ci_upper),
+            alpha=0.2, color="red", label="95% CI on AUC gap",
+        )
 
     ax1.set_xlabel("Fraction of Generation")
     ax1.set_ylabel("AUC")
@@ -1577,6 +1622,7 @@ def main():
                             "question_id": q_id,
                             "no_hint": nh_features,
                             "condition": cond_features,
+                            "hint_format": fmt,
                         }
                         if q_id in train_ids:
                             target_train.append(pair)
@@ -1591,6 +1637,7 @@ def main():
 
             # Build training array (all fractions pooled)
             X_train = np.vstack([train_feats[f] for f in range(N_FRACTIONS)])
+            del train_feats
             y_train = np.tile(train_y, N_FRACTIONS)
             g_train = np.tile(train_groups, N_FRACTIONS)
 
@@ -1613,6 +1660,7 @@ def main():
                 train_pairs_true, N_FRACTIONS, n_features
             )
             X_train_true = np.vstack([train_feats_true[f] for f in range(N_FRACTIONS)])
+            del train_feats_true
             y_train_true = np.tile(train_y_true, N_FRACTIONS)
             g_train_true = np.tile(train_groups_true, N_FRACTIONS)
 
@@ -1623,6 +1671,22 @@ def main():
                 test_pairs_true, N_FRACTIONS, n_features
             )
             true_auc = compute_auc_per_fraction(clf_true, test_feats_true, test_y_true, N_FRACTIONS)
+
+            # Bootstrap CI for AUC gap at each fraction
+            print("  Computing bootstrap CIs...")
+            ci_results = []
+            for f in range(N_FRACTIONS):
+                probs_f = clf.predict_proba(test_feats_false[f])[:, 1]
+                probs_t = clf_true.predict_proba(test_feats_true[f])[:, 1]
+                test_qids_false = np.array([p["question_id"] for p in test_pairs_false])
+                test_qids_true = np.array([p["question_id"] for p in test_pairs_true])
+                lower, upper = compute_bootstrap_ci(
+                    probs_f, test_y_false, probs_t, test_y_true,
+                    test_qids_false,
+                )
+                ci_results.append((lower, upper))
+            ci_lower = [c[0] for c in ci_results]
+            ci_upper = [c[1] for c in ci_results]
 
             # Divergence onset
             onset = compute_divergence_onset(false_auc, true_auc)
@@ -1637,8 +1701,7 @@ def main():
             per_format_auc = {}
             for fmt in HINT_FORMATS:
                 fmt_test_pairs = [p for p in test_pairs_false
-                                  if any(True for gk in groups
-                                         if gk == (p["question_id"], fmt))]
+                                  if p["hint_format"] == fmt]
                 if fmt_test_pairs:
                     fmt_feats, fmt_y, _ = build_paired_features(
                         fmt_test_pairs, N_FRACTIONS, n_features
@@ -1649,6 +1712,8 @@ def main():
             all_results[key] = {
                 "false_auc": false_auc,
                 "true_auc": true_auc,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
                 "onset_fraction_idx": onset,
                 "onset_fraction": FRACTION_POINTS[onset] if onset is not None else None,
                 "best_C": best_C,
@@ -1660,6 +1725,8 @@ def main():
                 false_auc, true_auc, FRACTION_POINTS,
                 f"AUC Curve — Layer {layer}, {width_k}k SAE",
                 figures_dir / f"auc_L{layer}_W{width_k}k.png",
+                ci_lower=ci_lower,
+                ci_upper=ci_upper,
             )
             print(f"  False AUC: {[f'{a:.3f}' for a in false_auc]}")
             print(f"  True AUC:  {[f'{a:.3f}' for a in true_auc]}")
