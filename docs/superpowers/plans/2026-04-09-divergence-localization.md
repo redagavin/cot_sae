@@ -645,7 +645,7 @@ class TestBootstrapCI:
         probs_false = rng.rand(n)
         y_false = (probs_false > 0.3).astype(int)
         probs_true = rng.rand(n) * 0.5
-        y_true = (probs_true > 0.5).astype(int)
+        y_true = (probs_true > 0.25).astype(int)
         question_ids = np.array([i // 2 for i in range(n)])
         lower, upper = compute_bootstrap_ci(
             probs_false, y_false, probs_true, y_true, question_ids,
