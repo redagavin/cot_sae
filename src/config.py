@@ -13,13 +13,13 @@ N_LAYERS = 26
 HIDDEN_DIM = 2304
 
 # SAE (base model SAEs — transfer well to IT model per Gemma Scope report)
-SAE_RELEASE = "gemma-scope-2b-pt-res"
-SAE_WIDTHS = [16, 65, 131]  # in thousands (16k, 65k, 131k)
+SAE_RELEASE = "gemma-scope-2b-pt-res-canonical"
+SAE_WIDTHS = [16, 65]  # in thousands (16k, 65k)
 
 # Dataset
 MMLU_DATASET = "cais/mmlu"
 MMLU_SPLIT = "all"
-BASELINE_POOL_SIZE = 200
+BASELINE_POOL_SIZE = 600
 TARGET_CORRECT = 50
 
 # Hint formats
@@ -39,11 +39,15 @@ HINT_KEYWORDS = {
 # Conditions
 CONDITIONS = ["no_hint", "true_hint", "false_hint"]
 
-# Selected layers for divergence localization
+# Divergence localization
 SELECTED_LAYERS = [12, 14, 16, 17, 22, 25]
+N_FRACTIONS = 20
+FRACTION_POINTS = [i / N_FRACTIONS for i in range(1, N_FRACTIONS + 1)]
+BATCH_SIZE = 128
+DIVERGENCE_DIR = OUTPUTS_DIR / "divergence"
 
 # Generation
-MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS = 4096
 
 # Answer labels
 ANSWER_LETTERS = ["A", "B", "C", "D"]
