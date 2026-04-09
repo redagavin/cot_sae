@@ -1421,7 +1421,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scipy import sparse as sp
 
 from src.config import (
     DIVERGENCE_DIR, SELECTED_LAYERS, SAE_WIDTHS, N_FRACTIONS,
@@ -1674,15 +1673,15 @@ def main():
 
             # Bootstrap CI for AUC gap at each fraction
             print("  Computing bootstrap CIs...")
+            # Question IDs matching the paired array structure (2 rows per pair)
+            test_qids = np.array([qid for p in test_pairs_false for qid in [p["question_id"]] * 2])
             ci_results = []
             for f in range(N_FRACTIONS):
                 probs_f = clf.predict_proba(test_feats_false[f])[:, 1]
                 probs_t = clf_true.predict_proba(test_feats_true[f])[:, 1]
-                test_qids_false = np.array([p["question_id"] for p in test_pairs_false])
-                test_qids_true = np.array([p["question_id"] for p in test_pairs_true])
                 lower, upper = compute_bootstrap_ci(
                     probs_f, test_y_false, probs_t, test_y_true,
-                    test_qids_false,
+                    test_qids,
                 )
                 ci_results.append((lower, upper))
             ci_lower = [c[0] for c in ci_results]
@@ -1733,7 +1732,7 @@ def main():
             print(f"  Onset: {FRACTION_POINTS[onset] if onset is not None else 'none'}")
 
             # Free memory
-            del train_feats, test_feats_false, train_feats_true, test_feats_true
+            del test_feats_false, test_feats_true
             del X_train, X_train_true
 
     # Text similarity baseline
