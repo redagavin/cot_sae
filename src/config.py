@@ -39,6 +39,9 @@ HINT_KEYWORDS = {
 # Conditions
 CONDITIONS = ["no_hint", "true_hint", "false_hint"]
 
+# Selected layers for divergence localization
+SELECTED_LAYERS = [12, 14, 16, 17, 22, 25]
+
 # Generation
 MAX_NEW_TOKENS = 256
 
