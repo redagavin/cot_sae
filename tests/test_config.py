@@ -11,6 +11,11 @@ from src.config import (
     N_LAYERS,
     DATA_DIR,
     OUTPUTS_DIR,
+    SELECTED_LAYERS,
+    N_FRACTIONS,
+    FRACTION_POINTS,
+    BATCH_SIZE,
+    DIVERGENCE_DIR,
 )
 
 
@@ -39,3 +44,13 @@ class TestConfigConsistency:
     def test_paths_are_path_objects(self):
         assert isinstance(DATA_DIR, Path)
         assert isinstance(OUTPUTS_DIR, Path)
+
+
+def test_divergence_localization_config():
+    assert SELECTED_LAYERS == [12, 14, 16, 17, 22, 25]
+    assert N_FRACTIONS == 20
+    assert len(FRACTION_POINTS) == 20
+    assert FRACTION_POINTS[0] == 0.05
+    assert FRACTION_POINTS[-1] == 1.0
+    assert BATCH_SIZE == 128
+    assert DIVERGENCE_DIR.name == "divergence"
