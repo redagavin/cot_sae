@@ -1528,8 +1528,6 @@ def plot_auc_curves(
     ax1.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Chance")
 
     if ci_lower is not None and ci_upper is not None:
-        # Plot confidence band around the AUC gap (centered on true_auc + gap)
-        gap = np.array([f - t for f, t in zip(false_auc, true_auc)])
         fractions_arr = np.array(fractions)
         true_arr = np.array(true_auc)
         # ci_lower/ci_upper are bounds on the gap itself, so the band is
@@ -1672,18 +1670,33 @@ def main():
             true_auc = compute_auc_per_fraction(clf_true, test_feats_true, test_y_true, N_FRACTIONS)
 
             # Bootstrap CI for AUC gap at each fraction
+            # Restrict to questions present in both false and true test sets
             print("  Computing bootstrap CIs...")
-            # Question IDs matching the paired array structure (2 rows per pair)
-            test_qids = np.array([qid for p in test_pairs_false for qid in [p["question_id"]] * 2])
+            false_qids_set = {p["question_id"] for p in test_pairs_false}
+            true_qids_set = {p["question_id"] for p in test_pairs_true}
+            shared_qids = sorted(false_qids_set & true_qids_set)
+
+            # Build aligned paired arrays for shared questions only
+            shared_pairs_false = [p for p in test_pairs_false if p["question_id"] in shared_qids]
+            shared_pairs_true = [p for p in test_pairs_true if p["question_id"] in shared_qids]
+            shared_feats_false, shared_y_false, _ = build_paired_features(
+                shared_pairs_false, N_FRACTIONS, n_features
+            )
+            shared_feats_true, shared_y_true, _ = build_paired_features(
+                shared_pairs_true, N_FRACTIONS, n_features
+            )
+            shared_qids_arr = np.array([qid for p in shared_pairs_false for qid in [p["question_id"]] * 2])
+
             ci_results = []
             for f in range(N_FRACTIONS):
-                probs_f = clf.predict_proba(test_feats_false[f])[:, 1]
-                probs_t = clf_true.predict_proba(test_feats_true[f])[:, 1]
+                probs_f = clf.predict_proba(shared_feats_false[f])[:, 1]
+                probs_t = clf_true.predict_proba(shared_feats_true[f])[:, 1]
                 lower, upper = compute_bootstrap_ci(
-                    probs_f, test_y_false, probs_t, test_y_true,
-                    test_qids,
+                    probs_f, shared_y_false, probs_t, shared_y_true,
+                    shared_qids_arr,
                 )
                 ci_results.append((lower, upper))
+            del shared_feats_false, shared_feats_true
             ci_lower = [c[0] for c in ci_results]
             ci_upper = [c[1] for c in ci_results]
 
