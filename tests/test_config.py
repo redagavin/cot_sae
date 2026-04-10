@@ -47,6 +47,10 @@ class TestConfigConsistency:
 
 
 def test_divergence_localization_config():
+    from src.config import (
+        SELECTED_LAYERS, N_FRACTIONS, FRACTION_POINTS,
+        BATCH_SIZE, DIVERGENCE_DIR,
+    )
     assert SELECTED_LAYERS == [12, 14, 16, 17, 22, 25]
     assert N_FRACTIONS == 20
     assert len(FRACTION_POINTS) == 20
