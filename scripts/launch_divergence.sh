@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PARTITION_GPU="gpu"
+PARTITION_GPU="177huntington"
 PARTITION_CPU="177huntington"
 CONDA_ENV="cot_sae"
 WORKDIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,9 +18,9 @@ echo ""
 # Phase 1: Data generation (GPU array job)
 JOB1=$(sbatch --parsable \
     --partition=$PARTITION_GPU \
-    --gres=gpu:1 \
+    --gres=gpu:a100:1 \
     --time=08:00:00 \
-    --mem=128G \
+    --mem=64G \
     --job-name=div-generate \
     --array=0-3 \
     --output=$WORKDIR/outputs/divergence/logs/phase1_%A_%a.log \

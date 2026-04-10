@@ -75,8 +75,11 @@ def generate_batch(model, tokenizer, prompts):
     return output_tokens, padded_prompt_length, attention_mask
 
 
-def forward_with_hooks(model, input_ids, attention_mask, captured):
-    """Run forward pass with hooks already registered. Populates captured dict."""
+FORWARD_BATCH_SIZE = 4
+
+
+def forward_with_hooks_single(model, input_ids, attention_mask, captured):
+    """Run forward pass for a single sequence or small batch. Populates captured dict."""
     with torch.no_grad():
         model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
@@ -84,7 +87,12 @@ def forward_with_hooks(model, input_ids, attention_mask, captured):
 def process_batch_with_sae(
     model, tokenizer, saes, prompts_info, batch_size,
 ):
-    """Generate text, run hooked forward pass, encode SAE features at fractional positions."""
+    """Generate text, run hooked forward pass in sub-batches, encode SAE features.
+
+    Generation uses the full batch_size for throughput. The hooked forward pass
+    processes FORWARD_BATCH_SIZE sequences at a time to avoid OOM from the
+    lm_head logits tensor.
+    """
     results = []
 
     for batch_start in range(0, len(prompts_info), batch_size):
@@ -100,9 +108,6 @@ def process_batch_with_sae(
             output_tokens, padded_prompt_length, eos_token_id
         )
 
-        captured = {}
-        hooks = register_layer_hooks(model, SELECTED_LAYERS, captured)
-
         full_attention_mask = torch.ones_like(output_tokens)
         full_attention_mask[:, :padded_prompt_length] = prompt_attention_mask
         for i in range(len(batch)):
@@ -110,8 +115,27 @@ def process_batch_with_sae(
             if eos_abs < output_tokens.shape[1]:
                 full_attention_mask[i, eos_abs:] = 0
 
-        forward_with_hooks(model, output_tokens, full_attention_mask, captured)
-        remove_hooks(hooks)
+        # Run hooked forward pass in sub-batches to avoid OOM
+        all_captured = {layer: [] for layer in SELECTED_LAYERS}
+        for sub_start in range(0, len(batch), FORWARD_BATCH_SIZE):
+            sub_end = min(sub_start + FORWARD_BATCH_SIZE, len(batch))
+            sub_tokens = output_tokens[sub_start:sub_end]
+            sub_mask = full_attention_mask[sub_start:sub_end]
+
+            captured = {}
+            hooks = register_layer_hooks(model, SELECTED_LAYERS, captured)
+            forward_with_hooks_single(model, sub_tokens, sub_mask, captured)
+            remove_hooks(hooks)
+
+            for layer in SELECTED_LAYERS:
+                all_captured[layer].append(captured[layer])
+
+            del captured
+            torch.cuda.empty_cache()
+
+        # Concatenate sub-batch captures
+        for layer in SELECTED_LAYERS:
+            all_captured[layer] = torch.cat(all_captured[layer], dim=0)
 
         for i, info in enumerate(batch):
             gen_len = max(gen_lengths[i], 1)
@@ -128,7 +152,7 @@ def process_batch_with_sae(
 
             sae_features = {}
             for layer in SELECTED_LAYERS:
-                residual = captured[layer][i]
+                residual = all_captured[layer][i]
                 for width_k in SAE_WIDTHS:
                     sae = saes[(layer, width_k)]
                     sparse_list = encode_at_fractions(sae, residual, fraction_indices)
@@ -148,7 +172,7 @@ def process_batch_with_sae(
             )
             results.append({"metadata": meta, "sae_features": sae_features})
 
-        del captured
+        del all_captured
         torch.cuda.empty_cache()
 
     return results

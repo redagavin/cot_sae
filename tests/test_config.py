@@ -56,5 +56,5 @@ def test_divergence_localization_config():
     assert len(FRACTION_POINTS) == 20
     assert FRACTION_POINTS[0] == 0.05
     assert FRACTION_POINTS[-1] == 1.0
-    assert BATCH_SIZE == 128
+    assert BATCH_SIZE == 64
     assert DIVERGENCE_DIR.name == "divergence"

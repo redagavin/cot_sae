@@ -39,13 +39,6 @@ HINT_KEYWORDS = {
 # Conditions
 CONDITIONS = ["no_hint", "true_hint", "false_hint"]
 
-# Divergence localization
-SELECTED_LAYERS = [12, 14, 16, 17, 22, 25]
-N_FRACTIONS = 20
-FRACTION_POINTS = [i / N_FRACTIONS for i in range(1, N_FRACTIONS + 1)]
-BATCH_SIZE = 128
-DIVERGENCE_DIR = OUTPUTS_DIR / "divergence"
-
 # Generation
 MAX_NEW_TOKENS = 4096
 
@@ -58,5 +51,5 @@ ANSWER_LETTERS = ["A", "B", "C", "D"]
 SELECTED_LAYERS = [12, 14, 16, 17, 22, 25]
 N_FRACTIONS = 20
 FRACTION_POINTS = [i / N_FRACTIONS for i in range(1, N_FRACTIONS + 1)]
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 DIVERGENCE_DIR = OUTPUTS_DIR / "divergence"
