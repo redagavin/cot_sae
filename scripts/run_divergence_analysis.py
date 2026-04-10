@@ -186,9 +186,13 @@ def main():
     combo_results_dir = results_dir / "per_combo"
     combo_results_dir.mkdir(parents=True, exist_ok=True)
     for combo_file in combo_results_dir.glob("*.json"):
-        with open(combo_file) as f:
-            saved = json.load(f)
-            all_results[combo_file.stem] = saved
+        try:
+            with open(combo_file) as f:
+                saved = json.load(f)
+                all_results[combo_file.stem] = saved
+        except (json.JSONDecodeError, KeyError):
+            print(f"  WARNING: corrupted combo file {combo_file.name}, will recompute")
+            combo_file.unlink()
 
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
