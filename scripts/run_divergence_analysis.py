@@ -178,8 +178,14 @@ def main():
                     run_ids_to_load.add(groups[group_key][condition]["run_id"])
 
     from tqdm import tqdm
-    for run_id in tqdm(sorted(run_ids_to_load), desc="Loading features"):
-        feature_cache[run_id] = load_all_run_features(features_dir, run_id)
+    from joblib import Parallel, delayed
+    sorted_run_ids = sorted(run_ids_to_load)
+    print(f"  Loading {len(sorted_run_ids)} files in parallel...")
+    loaded = Parallel(n_jobs=-1)(
+        delayed(load_all_run_features)(features_dir, rid) for rid in sorted_run_ids
+    )
+    feature_cache = dict(zip(sorted_run_ids, loaded))
+    del loaded
     print(f"Loaded {len(feature_cache)} feature files")
 
     # Load any previously saved per-combo results (for resuming)
