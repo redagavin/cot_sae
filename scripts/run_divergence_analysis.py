@@ -40,6 +40,11 @@ def load_run_features(features_dir: Path, run_id: str, layer_width_key: str) -> 
     return data[layer_width_key]
 
 
+def load_all_run_features(features_dir: Path, run_id: str) -> dict:
+    """Load all sparse SAE features for one run (all layer/width keys)."""
+    return torch.load(features_dir / f"{run_id}.pt", weights_only=True)
+
+
 def build_paired_features(
     question_data: list[dict],
     n_fractions: int,
@@ -156,6 +161,27 @@ def main():
 
     all_results = {}
 
+    # Preload all feature files once to avoid repeated disk I/O
+    print("Preloading feature files...")
+    feature_cache = {}  # {run_id: {layer_width_key: [sparse_list]}}
+    run_ids_to_load = set()
+    for q_id in question_ids:
+        nh_entry = no_hint_by_q.get(q_id)
+        if nh_entry:
+            run_ids_to_load.add(nh_entry["run_id"])
+        for fmt in HINT_FORMATS:
+            group_key = (q_id, fmt)
+            if group_key not in groups:
+                continue
+            for condition in ["false_hint", "true_hint"]:
+                if condition in groups[group_key]:
+                    run_ids_to_load.add(groups[group_key][condition]["run_id"])
+
+    from tqdm import tqdm
+    for run_id in tqdm(sorted(run_ids_to_load), desc="Loading features"):
+        feature_cache[run_id] = load_all_run_features(features_dir, run_id)
+    print(f"Loaded {len(feature_cache)} feature files")
+
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
             key = f"L{layer}_W{width_k}k"
@@ -171,7 +197,7 @@ def main():
                 nh_entry = no_hint_by_q.get(q_id)
                 if not nh_entry:
                     continue
-                nh_features = load_run_features(features_dir, nh_entry["run_id"], key)
+                nh_features = feature_cache[nh_entry["run_id"]][key]
 
                 for fmt in HINT_FORMATS:
                     group_key = (q_id, fmt)
@@ -185,9 +211,7 @@ def main():
                         if condition not in groups[group_key]:
                             continue
                         cond_entry = groups[group_key][condition]
-                        cond_features = load_run_features(
-                            features_dir, cond_entry["run_id"], key
-                        )
+                        cond_features = feature_cache[cond_entry["run_id"]][key]
                         pair = {
                             "question_id": q_id,
                             "no_hint": nh_features,
