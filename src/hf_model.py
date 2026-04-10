@@ -12,7 +12,9 @@ def load_hf_model(device: str = "cuda"):
         MODEL_NAME,
         torch_dtype=torch.float16,
         device_map=device,
+        attn_implementation="sdpa",
     )
+    model.eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -72,9 +74,9 @@ def register_layer_hooks(
     def make_hook(layer_idx):
         def hook_fn(module, input, output):
             if isinstance(output, tuple):
-                captured[layer_idx] = output[0].detach()
+                captured[layer_idx] = output[0].detach().cpu()
             else:
-                captured[layer_idx] = output.detach()
+                captured[layer_idx] = output.detach().cpu()
         return hook_fn
 
     hooks = []

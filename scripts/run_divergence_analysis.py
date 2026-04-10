@@ -22,6 +22,8 @@ from src.classifier import (
 from src.text_similarity import compute_text_similarity_curve
 from src.data import build_experiment_groups
 
+SAE_ACTUAL_FEATURES = {16: 16384, 65: 65536}
+
 
 def load_all_metadata(metadata_dir: Path) -> list[dict]:
     """Load and merge metadata from all array task files."""
@@ -157,7 +159,7 @@ def main():
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
             key = f"L{layer}_W{width_k}k"
-            n_features = width_k * 1000
+            n_features = SAE_ACTUAL_FEATURES[width_k]
             print(f"\n=== {key} ===")
 
             train_pairs_false = []
@@ -202,17 +204,15 @@ def main():
                 train_pairs_false, N_FRACTIONS, n_features
             )
 
-            X_train = np.vstack([train_feats[f] for f in range(N_FRACTIONS)])
-            del train_feats
-            y_train = np.tile(train_y, N_FRACTIONS)
-            g_train = np.tile(train_groups, N_FRACTIONS)
-
+            # Tune regularization on the last fraction (strongest signal, avoids pooling all fractions)
             print("  Tuning regularization...")
-            best_C = tune_regularization(X_train, y_train, g_train)
+            best_C = tune_regularization(train_feats[N_FRACTIONS - 1], train_y, train_groups)
             print(f"  Best C: {best_C}")
 
             print("  Training classifier...")
-            clf = train_classifier(X_train, y_train, C=best_C)
+            # Train on the last fraction too (consistent with tuning)
+            clf = train_classifier(train_feats[N_FRACTIONS - 1], train_y, C=best_C)
+            del train_feats
 
             print("  Computing AUC per fraction (false-hint)...")
             test_feats_false, test_y_false, _ = build_paired_features(
@@ -224,13 +224,10 @@ def main():
             train_feats_true, train_y_true, train_groups_true = build_paired_features(
                 train_pairs_true, N_FRACTIONS, n_features
             )
-            X_train_true = np.vstack([train_feats_true[f] for f in range(N_FRACTIONS)])
+            # Tune and train on the last fraction (consistent with false-hint approach)
+            best_C_true = tune_regularization(train_feats_true[N_FRACTIONS - 1], train_y_true, train_groups_true)
+            clf_true = train_classifier(train_feats_true[N_FRACTIONS - 1], train_y_true, C=best_C_true)
             del train_feats_true
-            y_train_true = np.tile(train_y_true, N_FRACTIONS)
-            g_train_true = np.tile(train_groups_true, N_FRACTIONS)
-
-            best_C_true = tune_regularization(X_train_true, y_train_true, g_train_true)
-            clf_true = train_classifier(X_train_true, y_train_true, C=best_C_true)
 
             test_feats_true, test_y_true, _ = build_paired_features(
                 test_pairs_true, N_FRACTIONS, n_features
@@ -244,6 +241,8 @@ def main():
 
             shared_pairs_false = [p for p in test_pairs_false if p["question_id"] in shared_qids]
             shared_pairs_true = [p for p in test_pairs_true if p["question_id"] in shared_qids]
+            assert len(shared_pairs_false) == len(shared_pairs_true), \
+                f"Bootstrap CI alignment: false ({len(shared_pairs_false)}) != true ({len(shared_pairs_true)})"
             shared_feats_false, shared_y_false, _ = build_paired_features(
                 shared_pairs_false, N_FRACTIONS, n_features
             )
@@ -306,7 +305,6 @@ def main():
             print(f"  Onset: {FRACTION_POINTS[onset] if onset is not None else 'none'}")
 
             del test_feats_false, test_feats_true
-            del X_train, X_train_true
 
     print("\nComputing text similarity baseline...")
     text_sims = []

@@ -53,7 +53,7 @@ def build_run_metadata(
     }
 
 
-def generate_batch(model, tokenizer, prompts, batch_size):
+def generate_batch(model, tokenizer, prompts):
     """Batched text generation without activation caching.
 
     Returns (output_tokens, padded_prompt_length, prompt_attention_mask).
@@ -78,7 +78,7 @@ def generate_batch(model, tokenizer, prompts, batch_size):
 def forward_with_hooks(model, input_ids, attention_mask, captured):
     """Run forward pass with hooks already registered. Populates captured dict."""
     with torch.no_grad():
-        model(input_ids=input_ids, attention_mask=attention_mask)
+        model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
 
 def process_batch_with_sae(
@@ -92,7 +92,7 @@ def process_batch_with_sae(
         prompts = [info["formatted_prompt"] for info in batch]
 
         output_tokens, padded_prompt_length, prompt_attention_mask = generate_batch(
-            model, tokenizer, prompts, batch_size
+            model, tokenizer, prompts
         )
 
         eos_token_id = tokenizer.eos_token_id or 1
@@ -186,7 +186,7 @@ def main():
             prompts.append(format_for_model(tokenizer, user_msg))
 
         output_tokens, padded_prompt_length, _ = generate_batch(
-            model, tokenizer, prompts, BATCH_SIZE
+            model, tokenizer, prompts
         )
         eos_token_id = tokenizer.eos_token_id or 1
         gen_lengths = extract_generation_lengths(
