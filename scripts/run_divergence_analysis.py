@@ -182,10 +182,23 @@ def main():
         feature_cache[run_id] = load_all_run_features(features_dir, run_id)
     print(f"Loaded {len(feature_cache)} feature files")
 
+    # Load any previously saved per-combo results (for resuming)
+    combo_results_dir = results_dir / "per_combo"
+    combo_results_dir.mkdir(parents=True, exist_ok=True)
+    for combo_file in combo_results_dir.glob("*.json"):
+        with open(combo_file) as f:
+            saved = json.load(f)
+            all_results[combo_file.stem] = saved
+
     for layer in SELECTED_LAYERS:
         for width_k in SAE_WIDTHS:
             key = f"L{layer}_W{width_k}k"
             n_features = SAE_ACTUAL_FEATURES[width_k]
+
+            if key in all_results:
+                print(f"\n=== {key} === (already computed, skipping)")
+                continue
+
             print(f"\n=== {key} ===")
 
             train_pairs_false = []
@@ -324,6 +337,10 @@ def main():
                 ci_lower=ci_lower,
                 ci_upper=ci_upper,
             )
+            # Save per-combo results for resuming
+            with open(combo_results_dir / f"{key}.json", "w") as f:
+                json.dump(all_results[key], f, indent=2)
+
             print(f"  False AUC: {[f'{a:.3f}' for a in false_auc]}")
             print(f"  True AUC:  {[f'{a:.3f}' for a in true_auc]}")
             print(f"  Onset: {FRACTION_POINTS[onset] if onset is not None else 'none'}")
