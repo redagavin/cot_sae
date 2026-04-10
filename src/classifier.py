@@ -3,6 +3,7 @@
 # ABOUTME: Includes GroupKFold CV for regularization tuning and bootstrap CI for onset detection.
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, GroupKFold
 from sklearn.metrics import roc_auc_score
@@ -28,7 +29,7 @@ def tune_regularization(
 
     for C in C_values:
         clf = LogisticRegression(C=C, penalty="l2", solver="lbfgs", max_iter=1000)
-        scores = cross_val_score(clf, X, y, cv=gkf, groups=groups, scoring="roc_auc")
+        scores = cross_val_score(clf, X, y, cv=gkf, groups=groups, scoring="roc_auc", n_jobs=-1)
         mean_score = scores.mean()
         if mean_score > best_score:
             best_score = mean_score
@@ -74,6 +75,23 @@ def compute_auc_per_fraction(
     return auc_curve
 
 
+def _bootstrap_one(
+    sampled_idx_false: np.ndarray,
+    sampled_idx_true: np.ndarray,
+    probs_false: np.ndarray,
+    y_false: np.ndarray,
+    probs_true: np.ndarray,
+    y_true: np.ndarray,
+) -> float | None:
+    """Compute one bootstrap AUC gap sample. Returns None if single-class."""
+    try:
+        auc_f = roc_auc_score(y_false[sampled_idx_false], probs_false[sampled_idx_false])
+        auc_t = roc_auc_score(y_true[sampled_idx_true], probs_true[sampled_idx_true])
+        return auc_f - auc_t
+    except ValueError:
+        return None
+
+
 def compute_bootstrap_ci(
     probs_false: np.ndarray,
     y_false: np.ndarray,
@@ -88,6 +106,7 @@ def compute_bootstrap_ci(
 
     Resamples unique question IDs, gathers all corresponding samples,
     and recomputes AUC for both conditions per resample.
+    Uses joblib for parallel execution across bootstrap iterations.
     """
     rng = np.random.RandomState(seed)
     unique_qids = np.unique(question_ids)
@@ -97,18 +116,23 @@ def compute_bootstrap_ci(
     for idx, qid in enumerate(question_ids):
         qid_to_idx.setdefault(qid, []).append(idx)
 
-    diffs = []
+    # Pre-generate all resampled indices for reproducibility
+    all_idx_false = []
+    all_idx_true = []
     for _ in range(n_bootstrap):
         sampled_qids = rng.choice(unique_qids, size=n_questions, replace=True)
-        idx_false = np.concatenate([qid_to_idx[q] for q in sampled_qids])
-        idx_true = np.concatenate([qid_to_idx[q] for q in sampled_qids])
+        all_idx_false.append(np.concatenate([qid_to_idx[q] for q in sampled_qids]))
+        all_idx_true.append(np.concatenate([qid_to_idx[q] for q in sampled_qids]))
 
-        try:
-            auc_f = roc_auc_score(y_false[idx_false], probs_false[idx_false])
-            auc_t = roc_auc_score(y_true[idx_true], probs_true[idx_true])
-            diffs.append(auc_f - auc_t)
-        except ValueError:
-            continue
+    results = Parallel(n_jobs=-1)(
+        delayed(_bootstrap_one)(
+            all_idx_false[i], all_idx_true[i],
+            probs_false, y_false, probs_true, y_true,
+        )
+        for i in range(n_bootstrap)
+    )
+
+    diffs = [r for r in results if r is not None]
 
     alpha = (1 - ci) / 2
     lower = np.percentile(diffs, 100 * alpha)

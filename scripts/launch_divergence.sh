@@ -33,8 +33,9 @@ echo "Phase 1 (generation): Array job $JOB1 (4 tasks)"
 JOB2=$(sbatch --parsable \
     --dependency=afterok:$JOB1 \
     --partition=$PARTITION_CPU \
-    --time=02:00:00 \
+    --time=08:00:00 \
     --mem=256G \
+    --cpus-per-task=64 \
     --job-name=div-analysis \
     --output=$WORKDIR/outputs/divergence/logs/phase2_%j.log \
     --error=$WORKDIR/outputs/divergence/logs/phase2_%j.err \
