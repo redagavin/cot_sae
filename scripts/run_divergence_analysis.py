@@ -264,12 +264,24 @@ def main():
                 train_pairs_false, N_FRACTIONS, n_features
             )
 
-            print("  Tuning regularization...")
-            best_C = tune_regularization(train_feats[N_FRACTIONS - 1], train_y, train_groups)
-            print(f"  Best C: {best_C}")
-
-            print("  Training classifier...")
-            clf = train_classifier(train_feats[N_FRACTIONS - 1], train_y, C=best_C)
+            # For 16k: pool all fractions for training (better early-divergence detection)
+            # For 65k: train on last fraction only (memory/compute constraint)
+            if width_k == 16:
+                print("  Tuning regularization (all fractions pooled)...")
+                X_train = np.vstack([train_feats[f] for f in range(N_FRACTIONS)])
+                y_train = np.tile(train_y, N_FRACTIONS)
+                g_train = np.tile(train_groups, N_FRACTIONS)
+                best_C = tune_regularization(X_train, y_train, g_train)
+                print(f"  Best C: {best_C}")
+                print("  Training classifier...")
+                clf = train_classifier(X_train, y_train, C=best_C)
+                del X_train, y_train, g_train
+            else:
+                print("  Tuning regularization (last fraction)...")
+                best_C = tune_regularization(train_feats[N_FRACTIONS - 1], train_y, train_groups)
+                print(f"  Best C: {best_C}")
+                print("  Training classifier...")
+                clf = train_classifier(train_feats[N_FRACTIONS - 1], train_y, C=best_C)
             del train_feats
 
             # Evaluate on false-hint test set
