@@ -234,6 +234,9 @@ def main():
                         if condition not in groups[group_key]:
                             continue
                         cond_entry = groups[group_key][condition]
+                        # Only include hint-following cases for false-hint
+                        if condition == "false_hint" and not cond_entry.get("hint_following", False):
+                            continue
                         cond_features = feature_cache[cond_entry["run_id"]][key]
                         pair = {
                             "question_id": q_id,
@@ -368,6 +371,8 @@ def main():
             if group_key not in groups or "false_hint" not in groups[group_key]:
                 continue
             fh_entry = groups[group_key]["false_hint"]
+            if not fh_entry.get("hint_following", False):
+                continue
             sim_curve = compute_text_similarity_curve(
                 nh_entry["response"], fh_entry["response"], FRACTION_POINTS
             )
