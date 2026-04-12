@@ -213,7 +213,6 @@ def main():
 
             train_pairs_false = []
             test_pairs_false = []
-            train_pairs_true = []
             test_pairs_true = []
 
             for q_id in question_ids:
@@ -226,91 +225,82 @@ def main():
                     group_key = (q_id, fmt)
                     if group_key not in groups:
                         continue
+                    if "false_hint" not in groups[group_key]:
+                        continue
+                    fh_entry = groups[group_key]["false_hint"]
 
-                    for condition, target_train, target_test in [
-                        ("false_hint", train_pairs_false, test_pairs_false),
-                        ("true_hint", train_pairs_true, test_pairs_true),
-                    ]:
-                        if condition not in groups[group_key]:
-                            continue
-                        cond_entry = groups[group_key][condition]
-                        # Only include hint-following cases for false-hint
-                        if condition == "false_hint" and not cond_entry.get("hint_following", False):
-                            continue
-                        cond_features = feature_cache[cond_entry["run_id"]][key]
-                        pair = {
-                            "question_id": q_id,
-                            "no_hint": nh_features,
-                            "condition": cond_features,
-                            "hint_format": fmt,
-                        }
-                        if q_id in train_ids:
-                            target_train.append(pair)
-                        else:
-                            target_test.append(pair)
+                    # Only include hint-following false-hint cases
+                    if not fh_entry.get("hint_following", False):
+                        continue
 
-            print(f"  False-hint: {len(train_pairs_false)} train, {len(test_pairs_false)} test pairs")
+                    fh_features = feature_cache[fh_entry["run_id"]][key]
+                    fh_pair = {
+                        "question_id": q_id,
+                        "no_hint": nh_features,
+                        "condition": fh_features,
+                        "hint_format": fmt,
+                    }
+                    if q_id in train_ids:
+                        train_pairs_false.append(fh_pair)
+                    else:
+                        test_pairs_false.append(fh_pair)
+
+                        # Matched true-hint control (test only, same question/format)
+                        if "true_hint" in groups[group_key]:
+                            th_entry = groups[group_key]["true_hint"]
+                            th_features = feature_cache[th_entry["run_id"]][key]
+                            test_pairs_true.append({
+                                "question_id": q_id,
+                                "no_hint": nh_features,
+                                "condition": th_features,
+                                "hint_format": fmt,
+                            })
+
+            print(f"  False-hint (hint-following): {len(train_pairs_false)} train, {len(test_pairs_false)} test pairs")
+            print(f"  True-hint (matched control): {len(test_pairs_true)} test pairs")
+
+            # Train classifier on false-hint-following vs no-hint
             train_feats, train_y, train_groups = build_paired_features(
                 train_pairs_false, N_FRACTIONS, n_features
             )
 
-            # Tune regularization on the last fraction (strongest signal, avoids pooling all fractions)
             print("  Tuning regularization...")
             best_C = tune_regularization(train_feats[N_FRACTIONS - 1], train_y, train_groups)
             print(f"  Best C: {best_C}")
 
             print("  Training classifier...")
-            # Train on the last fraction too (consistent with tuning)
             clf = train_classifier(train_feats[N_FRACTIONS - 1], train_y, C=best_C)
             del train_feats
 
+            # Evaluate on false-hint test set
             print("  Computing AUC per fraction (false-hint)...")
             test_feats_false, test_y_false, _ = build_paired_features(
                 test_pairs_false, N_FRACTIONS, n_features
             )
             false_auc = compute_auc_per_fraction(clf, test_feats_false, test_y_false, N_FRACTIONS)
 
-            print("  Computing true-hint control...")
-            train_feats_true, train_y_true, train_groups_true = build_paired_features(
-                train_pairs_true, N_FRACTIONS, n_features
-            )
-            # Tune and train on the last fraction (consistent with false-hint approach)
-            best_C_true = tune_regularization(train_feats_true[N_FRACTIONS - 1], train_y_true, train_groups_true)
-            clf_true = train_classifier(train_feats_true[N_FRACTIONS - 1], train_y_true, C=best_C_true)
-            del train_feats_true
-
+            # Evaluate SAME classifier on matched true-hint test set (transfer evaluation)
+            print("  Computing true-hint control (same classifier)...")
             test_feats_true, test_y_true, _ = build_paired_features(
                 test_pairs_true, N_FRACTIONS, n_features
             )
-            true_auc = compute_auc_per_fraction(clf_true, test_feats_true, test_y_true, N_FRACTIONS)
+            true_auc = compute_auc_per_fraction(clf, test_feats_true, test_y_true, N_FRACTIONS)
 
+            # Bootstrap CI for AUC gap using single classifier on matched pairs
             print("  Computing bootstrap CIs...")
-            false_qids_set = {p["question_id"] for p in test_pairs_false}
-            true_qids_set = {p["question_id"] for p in test_pairs_true}
-            shared_qids = sorted(false_qids_set & true_qids_set)
-
-            shared_pairs_false = [p for p in test_pairs_false if p["question_id"] in shared_qids]
-            shared_pairs_true = [p for p in test_pairs_true if p["question_id"] in shared_qids]
-            assert len(shared_pairs_false) == len(shared_pairs_true), \
-                f"Bootstrap CI alignment: false ({len(shared_pairs_false)}) != true ({len(shared_pairs_true)})"
-            shared_feats_false, shared_y_false, _ = build_paired_features(
-                shared_pairs_false, N_FRACTIONS, n_features
-            )
-            shared_feats_true, shared_y_true, _ = build_paired_features(
-                shared_pairs_true, N_FRACTIONS, n_features
-            )
-            shared_qids_arr = np.array([qid for p in shared_pairs_false for qid in [p["question_id"]] * 2])
+            assert len(test_pairs_false) == len(test_pairs_true), \
+                f"Bootstrap CI alignment: false ({len(test_pairs_false)}) != true ({len(test_pairs_true)})"
+            test_qids_arr = np.array([qid for p in test_pairs_false for qid in [p["question_id"]] * 2])
 
             ci_results = []
             for f in range(N_FRACTIONS):
-                probs_f = clf.predict_proba(shared_feats_false[f])[:, 1]
-                probs_t = clf_true.predict_proba(shared_feats_true[f])[:, 1]
+                probs_f = clf.predict_proba(test_feats_false[f])[:, 1]
+                probs_t = clf.predict_proba(test_feats_true[f])[:, 1]
                 lower, upper = compute_bootstrap_ci(
-                    probs_f, shared_y_false, probs_t, shared_y_true,
-                    shared_qids_arr,
+                    probs_f, test_y_false, probs_t, test_y_true,
+                    test_qids_arr,
                 )
                 ci_results.append((lower, upper))
-            del shared_feats_false, shared_feats_true
             ci_lower = [c[0] for c in ci_results]
             ci_upper = [c[1] for c in ci_results]
 
@@ -321,6 +311,7 @@ def main():
             top_indices = np.argsort(weights)[-top_k:][::-1]
             top_features = [(int(idx), float(weights[idx])) for idx in top_indices]
 
+            # Per-format AUC on test set
             per_format_auc = {}
             for fmt in HINT_FORMATS:
                 fmt_test_pairs = [p for p in test_pairs_false if p["hint_format"] == fmt]
@@ -350,7 +341,6 @@ def main():
                 ci_lower=ci_lower,
                 ci_upper=ci_upper,
             )
-            # Save per-combo results for resuming
             with open(combo_results_dir / f"{key}.json", "w") as f:
                 json.dump(all_results[key], f, indent=2)
 
