@@ -30,3 +30,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local-only
+CLAUDE.md
+.claude/
+overleaf/
