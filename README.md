@@ -1,4 +1,4 @@
-# CoT-SAE: Detecting Unfaithful Chain-of-Thought with Sparse Autoencoders
+# CoT-SAE: Analyzing Unfaithful Chain-of-Thought with Sparse Autoencoders
 
 Research code for the divergence-localization experiment: a single-classifier transfer test for SAE feature specificity on Gemma 2 2B-it with Gemma Scope SAEs.
 
