@@ -71,10 +71,10 @@ def compute_layer_recommendation(
     sae_counts_mean: dict[int, list[float]],
     sae_counts_max: dict[int, list[float]] | None = None,
 ) -> dict:
-    """Compute recommended 2-3 layers and best SAE width from all signals.
+    """Compute recommended 3 layers and best SAE width using SAE signal only.
 
-    Uses rank-aggregation with equal weight between logit lens (cosine+JSD averaged)
-    and SAE signal (mean-pool and max-pool ranks averaged). Picks top 3 layers.
+    Uses rank-aggregation of SAE mean-pool and max-pool ranks. Picks top 3 layers.
+    Logit lens arguments are accepted but not used in ranking.
     """
     n = len(logit_cosine)
 
@@ -85,11 +85,6 @@ def compute_layer_recommendation(
         for rank, idx in enumerate(order):
             ranks[idx] = rank
         return ranks
-
-    # Logit lens: average cosine and JSD ranks
-    cosine_ranks = rank_desc(logit_cosine)
-    jsd_ranks = rank_desc(logit_jsd)
-    logit_lens_ranks = [0.5 * (cosine_ranks[i] + jsd_ranks[i]) for i in range(n)]
 
     # Best SAE width: highest mean fraction of differential features
     available_widths = [w for w in SAE_WIDTHS if w in sae_counts_mean]
@@ -109,8 +104,7 @@ def compute_layer_recommendation(
     else:
         sae_ranks = mean_ranks
 
-    # Equal weight: logit lens + SAE
-    total_ranks = [logit_lens_ranks[i] + sae_ranks[i] for i in range(n)]
+    total_ranks = sae_ranks
     sorted_layers = sorted(range(n), key=lambda i: total_ranks[i])
 
     recommended = sorted_layers[:3]

@@ -12,7 +12,7 @@ def project_to_logits(
 ) -> torch.Tensor:
     """Project residual stream to logit space via final LayerNorm + unembedding."""
     normed = ln_final(residual)
-    return normed @ unembed_matrix
+    return normed.to(unembed_matrix.dtype) @ unembed_matrix
 
 
 def compute_token_divergence(

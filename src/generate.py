@@ -63,7 +63,7 @@ def generate_with_cache(
     )
 
     _, cache = model.run_with_cache(
-        output_tokens,
+        output_tokens.clone(),
         names_filter=lambda name: "resid_post" in name,
     )
 

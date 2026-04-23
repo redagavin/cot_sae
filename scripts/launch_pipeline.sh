@@ -22,7 +22,7 @@ JOB1=$(sbatch --parsable \
     --job-name=sweep-generate \
     --output=$WORKDIR/outputs/logs/stage1_%j.log \
     --error=$WORKDIR/outputs/logs/stage1_%j.err \
-    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV python scripts/run_baseline.py && conda run -n $CONDA_ENV python scripts/run_generation.py")
+    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV env PYTHONPATH=$WORKDIR python scripts/run_baseline.py && conda run -n $CONDA_ENV env PYTHONPATH=$WORKDIR python scripts/run_generation.py")
 
 echo "Stage 1 (baseline + generation): Job $JOB1"
 
@@ -36,7 +36,7 @@ JOB2=$(sbatch --parsable \
     --job-name=sweep-analysis \
     --output=$WORKDIR/outputs/logs/stage2_%j.log \
     --error=$WORKDIR/outputs/logs/stage2_%j.err \
-    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV python scripts/run_logit_lens.py && conda run -n $CONDA_ENV python scripts/run_sae_analysis.py")
+    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV env PYTHONPATH=$WORKDIR python scripts/run_logit_lens.py && conda run -n $CONDA_ENV env PYTHONPATH=$WORKDIR python scripts/run_sae_analysis.py")
 
 echo "Stage 2 (logit lens + SAE):       Job $JOB2 (depends on $JOB1)"
 
@@ -49,7 +49,7 @@ JOB3=$(sbatch --parsable \
     --job-name=sweep-comparison \
     --output=$WORKDIR/outputs/logs/stage3_%j.log \
     --error=$WORKDIR/outputs/logs/stage3_%j.err \
-    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV python scripts/run_comparison.py")
+    --wrap="cd $WORKDIR && conda run -n $CONDA_ENV env PYTHONPATH=$WORKDIR python scripts/run_comparison.py")
 
 echo "Stage 3 (comparison):             Job $JOB3 (depends on $JOB2)"
 

@@ -5,13 +5,13 @@ import json
 import torch
 from tqdm import tqdm
 
-from src.config import OUTPUTS_DIR, N_LAYERS, HINT_FORMATS
+from src.config import OUTPUTS_DIR, N_LAYERS, HINT_FORMATS, MAX_NEW_TOKENS
 from src.logit_lens import compute_token_divergence, masked_mean
 from src.data import build_experiment_groups
 from src.generate import load_model
 
 
-def run_comparison(groups, activations_dir, ln_final, unembed, condition_key, n_layers, max_tokens):
+def run_comparison(groups, activations_dir, ln_final, unembed, condition_key, n_layers, max_tokens, device="cpu"):
     """Compute logit lens divergence for no-hint vs a target condition across all layers.
 
     Returns heatmaps, per-format heatmaps, and count-weighted means.
@@ -38,8 +38,8 @@ def run_comparison(groups, activations_dir, ln_final, unembed, condition_key, n_
         prompt_len_cond = cond_entry["prompt_length"]
 
         for layer in range(n_layers):
-            nh_resid = no_hint_acts[layer][prompt_len_nh:].float()
-            cond_resid = cond_acts[layer][prompt_len_cond:].float()
+            nh_resid = no_hint_acts[layer][prompt_len_nh:].to(device=device, dtype=torch.float32)
+            cond_resid = cond_acts[layer][prompt_len_cond:].to(device=device, dtype=torch.float32)
 
             min_len = min(len(nh_resid), len(cond_resid))
             if min_len == 0:
@@ -50,9 +50,10 @@ def run_comparison(groups, activations_dir, ln_final, unembed, condition_key, n_
             )
 
             for metric in ["cosine", "jsd"]:
-                layer_sum[metric][layer][:min_len] += divergence[metric]
+                div_cpu = divergence[metric].cpu()
+                layer_sum[metric][layer][:min_len] += div_cpu
                 layer_count[metric][layer][:min_len] += 1
-                fmt_sum[hint_format][metric][layer][:min_len] += divergence[metric]
+                fmt_sum[hint_format][metric][layer][:min_len] += div_cpu
                 fmt_count[hint_format][metric][layer][:min_len] += 1
 
     # Aggregate with masked mean
@@ -94,18 +95,19 @@ def main():
 
     print("Loading model for LayerNorm and unembedding matrix...")
     model = load_model()
-    ln_final = model.ln_final.cpu().float()
-    unembed = model.W_U.detach().cpu().float()
+    ln_final = model.ln_final.float()
+    unembed = model.W_U.detach().float()
+    device = unembed.device
     del model
     torch.cuda.empty_cache()
 
     no_hint_by_q, groups = build_experiment_groups(metadata)
 
-    max_tokens = 256
+    max_tokens = MAX_NEW_TOKENS
 
     print("Analyzing no-hint vs false-hint...")
     false_heatmaps, false_fmt_heatmaps, false_weighted = run_comparison(
-        groups, activations_dir, ln_final, unembed, "false_hint", N_LAYERS, max_tokens
+        groups, activations_dir, ln_final, unembed, "false_hint", N_LAYERS, max_tokens, device
     )
     torch.save(false_heatmaps, results_dir / "heatmaps_false_hint.pt")
     for fmt in HINT_FORMATS:
@@ -113,7 +115,7 @@ def main():
 
     print("Analyzing no-hint vs true-hint (control)...")
     true_heatmaps, true_fmt_heatmaps, true_weighted = run_comparison(
-        groups, activations_dir, ln_final, unembed, "true_hint", N_LAYERS, max_tokens
+        groups, activations_dir, ln_final, unembed, "true_hint", N_LAYERS, max_tokens, device
     )
     torch.save(true_heatmaps, results_dir / "heatmaps_true_hint.pt")
 

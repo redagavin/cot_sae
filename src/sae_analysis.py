@@ -22,6 +22,7 @@ def load_sae(layer: int, width_k: int):
     sae = SAE.from_pretrained(
         release=SAE_RELEASE,
         sae_id=f"layer_{layer}/width_{width_k}k/canonical",
+        device="cuda",
     )
     return sae
 
